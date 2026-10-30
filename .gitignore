@@ -1,0 +1,7 @@
+build/
+*.user
+livedelay.dll
+
+# lokalne, nie dla publicznego repo
+.cursor/
+todo.md
