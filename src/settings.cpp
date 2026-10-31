@@ -1190,6 +1190,7 @@ bool Save() {
 		ReadIniHints();
 	}
 	ApplyHotkeys();
+	AppLog(L"zapisano ustawienia");
 	TouchIniStamp();
 	g_iniWhen = IniWriteTime();
 	g_dirty = false;
@@ -1233,12 +1234,12 @@ void Build() {
 	MakeLabel(L"s", kPadX + 318, generalY[0] + 4, 40, 0, true);
 	MakeLabel(L"MB", kPadX + 318, generalY[1] + 4, 40, 0, true);
 	g_hint = MakeWrapLabel(L"", kPadX + 188, generalY[1] + 36, kRight - kPadX - 188, 36, 0);
-	MakeWrapLabel(L"Nasłuch RTMP to adres, który wpisujesz w Streamlabs. Adres API obsługuje panel, overlay i podgląd. "
-		      L"Zmiana każdego z nich przeładowuje silnik.",
+	MakeWrapLabel(L"Nasłuch RTMP to adres, który wpisujesz w programie nadającym z tego PC. Adres API obsługuje panel, "
+		      L"overlay i podgląd. Zmiana każdego z nich przeładowuje silnik.",
 		      kPadX, 304, kRight - kPadX, 44, 0);
 
 	// ---- Platformy ----
-	MakeWrapLabel(L"LiveDelay odbiera stream ze Streamlabs i wysyła go dalej na te platformy.", kPadX, 92, kRight - kPadX, 22, 1);
+	MakeWrapLabel(L"LiveDelay odbiera obraz z tego PC i wysyła go dalej na te platformy.", kPadX, 92, kRight - kPadX, 22, 1);
 	HWND list = Make(L"LISTBOX", L"", WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS, kPadX, 120, 160,
 			 240, IDC_LIST, 1);
 	SendMessageW(list, LB_SETITEMHEIGHT, 0, Si(28));
@@ -1269,7 +1270,7 @@ void Build() {
 	MakeButton(L"Pokaż", kRight - 82, 120 + 4 * 40, 82, IDC_SHOWKEY, 1, Kind::Push, 28);
 	MakeCheck(L"Startuj razem ze streamem", ctlX, 364, kRight - ctlX, IDC_AUTOSTART, 1, true);
 	MakeWrapLabel(L"Serwer wybierz z listy albo zostaw Własny adres i wpisz swój. Klucz wejściowy to ten, którym "
-		      L"Streamlabs publikuje do LiveDelay — puste pole silnik wypełnia sam.",
+		      L"program na tym PC publikuje do LiveDelay — puste pole silnik wypełnia sam.",
 		      fieldX, 398, kRight - fieldX, 60, 1);
 
 	// ---- Overlay ----
@@ -1517,6 +1518,14 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		SetTextColor(dc, Gdi(IsWindowEnabled((HWND)lp) ? kText : kMuted));
 		return (LRESULT)g_brFace;
 	}
+	case WM_NCACTIVATE:
+		SuppressSystemFrame(hwnd);
+		return DefWindowProcW(hwnd, WM_NCACTIVATE, wp, -1);
+	case WM_NCPAINT:
+		return 0;
+	case WM_ACTIVATE:
+		SuppressSystemFrame(hwnd);
+		return DefWindowProcW(hwnd, msg, wp, lp);
 	case WM_NCCALCSIZE:
 		if (wp)
 			return 0; // the caption is ours; the client covers the window
@@ -1620,6 +1629,7 @@ bool ShowSettings(HWND owner) {
 				nullptr);
 	if (!g_wnd)
 		return false;
+	SuppressSystemFrame(g_wnd);
 
 	ReadEverything();
 	Build();

@@ -1,18 +1,32 @@
 #include "core.hpp"
 
+#include <dwmapi.h>
 #include <shellapi.h>
 #include <winhttp.h>
 
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 
+#pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "shell32.lib")
 
 namespace ld {
 
 float g_scale = 1.0f;
+
+void SuppressSystemFrame(HWND hwnd) {
+	if (!hwnd)
+		return;
+	// 33 = DWMWA_WINDOW_CORNER_PREFERENCE, 1 = DWMWCP_DONOTROUND.
+	// 34 = DWMWA_BORDER_COLOR. The ink color, so a leftover line matches the window.
+	const int corner = 1;
+	const COLORREF border = Gdi(kBg);
+	DwmSetWindowAttribute(hwnd, 33, &corner, sizeof(corner));
+	DwmSetWindowAttribute(hwnd, 34, &border, sizeof(border));
+}
 
 std::wstring g_ini;
 std::wstring g_listen = L"127.0.0.1:1935";
@@ -251,6 +265,26 @@ bool JsonBool(const std::string &j, const char *key, size_t from) {
 	std::string pat = std::string("\"") + key + "\":";
 	size_t p = j.find(pat, from);
 	return p != std::string::npos && j.compare(p + pat.size(), 4, "true") == 0;
+}
+
+std::deque<std::wstring> g_appLog;
+
+void AppLog(const std::wstring &msg) {
+	SYSTEMTIME t;
+	GetLocalTime(&t);
+	wchar_t head[24];
+	swprintf_s(head, L"[%02u:%02u:%02u] app: ", t.wHour, t.wMinute, t.wSecond);
+	g_appLog.push_back(std::wstring(head) + msg);
+	while (g_appLog.size() > 2000)
+		g_appLog.pop_front();
+}
+
+size_t AppLogCount() {
+	return g_appLog.size();
+}
+
+std::vector<std::wstring> AppLogSnapshot() {
+	return {g_appLog.begin(), g_appLog.end()};
 }
 
 } // namespace ld

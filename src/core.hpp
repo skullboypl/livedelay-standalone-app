@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <string>
+#include <vector>
 
 namespace ld {
 
@@ -107,6 +108,15 @@ std::wstring RtmpUrl();
 
 void OpenUrl(const std::wstring &url);
 void Copy(HWND owner, const std::wstring &text);
+
+// One line from this process, timestamped. The engine's own lines come from GET /logs.
+void AppLog(const std::wstring &msg);
+size_t AppLogCount();
+std::vector<std::wstring> AppLogSnapshot();
+
+// WS_THICKFRAME keeps the shadow, and Windows 11 then draws a light frame
+// over the window whenever it loses and regains focus. Paint that frame away.
+void SuppressSystemFrame(HWND hwnd);
 
 // ---------------------------------------------------------------- JSON reading
 

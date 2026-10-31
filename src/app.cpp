@@ -5,6 +5,8 @@
 
 #include "core.hpp"
 #include "settings.hpp"
+#include "update.hpp"
+#include "webview.hpp"
 
 #include <windows.h>
 #include <windowsx.h>
@@ -51,6 +53,14 @@ constexpr int ID_NAV_TOGGLE = 110;
 constexpr int ID_MIN = 112;
 constexpr int ID_MAX = 113;
 constexpr int ID_CLOSE = 114;
+constexpr int ID_COPY_LOGS = 115;
+constexpr int ID_WEB_FALLBACK = 116;
+constexpr int ID_COPY_WIDGET = 117;
+constexpr int ID_UPDATE_GO = 130;
+constexpr int ID_UPDATE_LATER = 131;
+constexpr int ID_UPDATE_CHECK = 132;
+constexpr int ID_DANGER_PICK = 133;
+constexpr int ID_DANGER_RUN = 134;
 // One per sidebar entry that switches the view: ID_NAV + View.
 constexpr int ID_NAV = 120;
 constexpr int HOTKEY_ARM = 0x4C01;
@@ -120,6 +130,7 @@ struct Dest {
 };
 
 std::vector<Dest> g_dests;
+std::vector<std::wstring> g_destTips;
 
 // One bitrate sample a second per line, same as the dock's sparkline.
 constexpr size_t kHistory = 48;
@@ -146,7 +157,7 @@ std::unordered_map<std::wstring, Glyph> g_text;
 
 enum class Icon {
 	None, Arm, Activate, Live, LiveAfter, Disarm, Settings, Preview, Overlay, Theme, Copy, Help, Gauge, Globe, Link,
-	Collapse, WinMin, WinMax, WinClose
+	Logs, Info, Collapse, WinMin, WinMax, WinClose
 };
 
 // Normal is the outlined button; Solid is the one action that matters right
@@ -173,7 +184,30 @@ struct Rect {
 	float x = 0, y = 0, w = 0, h = 0;
 };
 
-enum class View { Board, Addresses, Widgets };
+enum class View { Board, Addresses, Widgets, Logs, About };
+enum class WebPage { Preview, Overlay, Theme };
+
+WebPage g_webPage = WebPage::Overlay;
+
+std::wstring WithEmbed(std::wstring url) {
+	url += url.find(L'?') == std::wstring::npos ? L"?inapp=1" : L"&inapp=1";
+	return url;
+}
+
+std::wstring PublicWebUrl() {
+	switch (g_webPage) {
+	case WebPage::Overlay:
+		return OverlayUrl();
+	case WebPage::Theme:
+		return ThemeUrl();
+	default:
+		return PreviewUrl();
+	}
+}
+
+std::wstring WebUrl() {
+	return WithEmbed(PublicWebUrl());
+}
 
 View g_view = View::Board;
 bool g_navMin = false;
@@ -206,8 +240,9 @@ float Approach(float &v, float target, float tau = 0.085f) {
 
 // Filled by Layout, read by Paint.
 Rect g_topR;
-Rect g_navR, g_mainR, g_footR, g_chipR;
-Rect g_stateR, g_ctrlR, g_destsR, g_addrR, g_barR, g_delayBoxR;
+Rect g_navR, g_mainR, g_footR, g_chipR, g_bannerR, g_urlR, g_aboutR, g_dangerR;
+bool g_dangerOn = false;
+Rect g_stateR, g_ctrlR, g_destsR, g_addrR, g_barR, g_delayBoxR, g_logR, g_webR;
 float g_titleY = 0;
 float g_grpY = 0;
 bool g_showBar = false;
@@ -276,13 +311,84 @@ void Offline() {
 	g_dests.clear();
 }
 
+std::string g_engineRaw;
+std::vector<std::wstring> g_logView;
+int g_logScroll = 0;
+bool g_logStick = true;
+
+std::wstring TagEngine(const std::wstring &line) {
+	std::wstring s = line;
+	size_t p = 0;
+	while ((p = s.find(L"live_", p)) != std::wstring::npos) {
+		size_t e = p + 5;
+		while (e < s.size() && (iswalnum(s[e]) || s[e] == L'_'))
+			++e;
+		if (e - p > 12) {
+			s.replace(p, e - p, L"live_…");
+			p += 6;
+		} else {
+			p = e;
+		}
+	}
+	if (s.size() >= 11 && s[0] == L'[')
+		return s.substr(0, 11) + L"silnik: " + s.substr(11);
+	return L"silnik: " + s;
+}
+
+void RebuildLogView() {
+	std::vector<std::wstring> engine;
+	std::wstring all = Utf8(g_engineRaw);
+	size_t i = 0;
+	while (i < all.size()) {
+		size_t n = all.find(L'\n', i);
+		std::wstring line = all.substr(i, n == std::wstring::npos ? std::wstring::npos : n - i);
+		if (!line.empty() && line.back() == L'\r')
+			line.pop_back();
+		if (!line.empty())
+			engine.push_back(TagEngine(line));
+		if (n == std::wstring::npos)
+			break;
+		i = n + 1;
+	}
+	const std::vector<std::wstring> app = AppLogSnapshot();
+	g_logView.clear();
+	g_logView.reserve(engine.size() + app.size());
+	size_t a = 0, b = 0;
+	auto stamp = [](const std::wstring &s) { return s.size() >= 10 ? s.substr(0, 10) : s; };
+	while (a < engine.size() || b < app.size()) {
+		if (b >= app.size() || (a < engine.size() && stamp(engine[a]) <= stamp(app[b])))
+			g_logView.push_back(std::move(engine[a++]));
+		else
+			g_logView.push_back(app[b++]);
+	}
+}
+
+void RefreshLogs() {
+	std::string body = Http(L"GET", L"/logs");
+	const bool engineChanged = !body.empty() && body != g_engineRaw;
+	if (engineChanged)
+		g_engineRaw = std::move(body);
+	static size_t seenApp = (size_t)-1;
+	const size_t appCount = AppLogCount();
+	if (!engineChanged && appCount == seenApp)
+		return;
+	seenApp = appCount;
+	RebuildLogView();
+}
+
 void Refresh() {
+	const bool was = g_connected;
 	std::string body = Http(L"GET", L"/state");
 	if (body.empty() || body.find("\"mode\"") == std::string::npos) {
+		if (was)
+			AppLog(L"utracono połączenie z silnikiem");
 		Offline();
 		return;
 	}
 	ParseState(body);
+	if (!was)
+		AppLog(L"połączono z silnikiem");
+	RefreshLogs();
 }
 
 void PostAction(const std::wstring &path) {
@@ -319,11 +425,23 @@ EngineLoad LoadEngine() {
 		candidates[0] = env;
 	for (const std::wstring &path : candidates) {
 		g_dll = LoadLibraryW(path.c_str());
-		if (g_dll)
+		if (g_dll) {
+			AppLog(L"załadowano silnik: " + path);
 			break;
+		}
 	}
-	if (!g_dll)
+	if (!g_dll) {
+		AppLog(L"nie ma livedelay.dll obok programu");
 		return EngineLoad::Missing;
+	}
+	using HostFn = void(__cdecl *)(const char *);
+	if (HostFn setHost = (HostFn)GetProcAddress(g_dll, "ld_set_host"))
+		setHost("app");
+	using VerFn = const char *(__cdecl *)();
+	if (VerFn ver = (VerFn)GetProcAddress(g_dll, "ld_version"))
+		if (const char *s = ver())
+			SetPluginVersion(Utf8(s));
+	AppLog(L"wtyczka " + PluginVersion());
 	g_start = (StartFn)GetProcAddress(g_dll, "ld_start");
 	g_stop = (StopFn)GetProcAddress(g_dll, "ld_stop");
 	g_lastErr = (ErrFn)GetProcAddress(g_dll, "ld_last_error");
@@ -333,9 +451,11 @@ EngineLoad LoadEngine() {
 	if (g_start(ini.c_str()) != 0) {
 		char msg[512] = {};
 		g_lastErr(msg, sizeof msg);
+		AppLog(L"silnik nie wystartował");
 		MessageBoxW(nullptr, Utf8(msg[0] ? msg : "ld_start failed").c_str(), L"LiveDelay", MB_OK | MB_ICONWARNING);
 		return EngineLoad::Failed;
 	}
+	AppLog(L"silnik wystartował");
 	return EngineLoad::Ok;
 }
 
@@ -549,6 +669,18 @@ void DrawIcon(Icon kind, float x, float y, float size, Col c) {
 		Ring(px(12), py(12), 8.5f * u, c, t);
 		Stroke(px(3.5f), py(12), px(20.5f), py(12), c, t);
 		Arc(px(12), py(12), 4.2f * u, 8.5f * u, 0.0f, 360.0f, c, t); // the meridian
+		break;
+	case Icon::Logs: // three lines of a log
+		for (int i = 0; i < 3; ++i) {
+			const float ly = 6.5f + i * 5.5f;
+			FillDot(px(5.5f), py(ly), 1.3f * u, c);
+			Stroke(px(9), py(ly), px(19), py(ly), c, t);
+		}
+		break;
+	case Icon::Info: // the about mark
+		Ring(px(12), py(12), 8.5f * u, c, t);
+		FillDot(px(12), py(8), 1.4f * u, c);
+		Stroke(px(12), py(11.5f), px(12), py(16.5f), c, t);
 		break;
 	case Icon::Link: // a plug on a lead: the addresses
 		StrokeRound(px(8), py(4), 8 * u, 7 * u, 2 * u, c, t);
@@ -768,18 +900,50 @@ std::wstring PillText(Col &bg) {
 	return L"NA ŻYWO";
 }
 
+std::wstring DestErrorLong(const Dest &d);
+
 std::wstring DetailText() {
 	if (!g_connected)
 		return L"Silnik nie odpowiada na " + g_api;
 	std::wstring d;
 	if (!g_input)
-		d = g_delayed ? L"Streamlabs przestał nadawać. Wysyłam resztę buforu."
-			      : L"Rozpocznij transmisję w Streamlabs. Uzbroić możesz już teraz.";
+		d = g_delayed ? L"Program na tym PC przestał nadawać. Wysyłam resztę buforu."
+			      : L"Rozpocznij transmisję na tym PC. Uzbroić możesz już teraz.";
 	else if (g_armDelay > 0)
 		d = L"Bufor " + Tenth(g_bufferS) + L" s · " + Round(g_bufferMb) + L" MB w RAM";
+	for (const Dest &dest : g_dests) {
+		if (dest.state == "error") {
+			d += (d.empty() ? L"" : L"   ") + dest.name + L": " + DestErrorLong(dest);
+			break;
+		}
+	}
 	if (g_cutPending)
 		d += (d.empty() ? L"" : L"   ") + std::wstring(L"Powrót na żywo czeka, aż ta chwila dotrze do widzów.");
 	return d;
+}
+
+std::wstring DestErrorLong(const Dest &d) {
+	const std::wstring &e = d.error;
+	if (e.find(L"end of file") != std::wstring::npos || e.find(L"connection reset") != std::wstring::npos)
+		return L"połączenie zerwane — sprawdź klucz i serwer";
+	if (e.find(L"timed out") != std::wstring::npos)
+		return L"serwer nie odpowiada";
+	if (e.find(L"BadName") != std::wstring::npos || e.find(L"Rejected") != std::wstring::npos)
+		return L"serwer odrzucił klucz";
+	if (!e.empty())
+		return e;
+	return L"błąd wysyłki";
+}
+
+std::wstring DestErrorShort(const Dest &d) {
+	const std::wstring &e = d.error;
+	if (e.find(L"end of file") != std::wstring::npos || e.find(L"connection reset") != std::wstring::npos)
+		return L"zerwane";
+	if (e.find(L"timed out") != std::wstring::npos)
+		return L"brak odpowiedzi";
+	if (e.find(L"BadName") != std::wstring::npos || e.find(L"Rejected") != std::wstring::npos)
+		return L"odrzucony klucz";
+	return L"błąd";
 }
 
 std::wstring DestState(const Dest &d) {
@@ -790,7 +954,7 @@ std::wstring DestState(const Dest &d) {
 	if (d.state == "live")
 		return L"nadaje";
 	if (d.state == "error")
-		return L"błąd";
+		return DestErrorShort(d);
 	if (d.state == "stopped")
 		return L"zatrzymana";
 	return Utf8(d.state);
@@ -901,6 +1065,10 @@ std::wstring ViewTitle() {
 		return L"Adresy";
 	case View::Widgets:
 		return L"Widgety";
+	case View::Logs:
+		return L"Logi";
+	case View::About:
+		return L"O aplikacji";
 	default:
 		return L"Pulpit";
 	}
@@ -922,8 +1090,10 @@ void LayoutNav(float height) {
 
 	const NavEntry views[] = {
 		{L"Pulpit", Icon::Gauge, ID_NAV + (int)View::Board, L"Stan, opóźnienie i platformy."},
-		{L"Adresy", Icon::Link, ID_NAV + (int)View::Addresses, L"Co wkleić w Streamlabs i w źródło przeglądarki."},
-		{L"Widgety", Icon::Preview, ID_NAV + (int)View::Widgets, L"Podgląd, overlay i edytor wyglądu."},
+		{L"Adresy", Icon::Link, ID_NAV + (int)View::Addresses, L"Co wkleić w programie na tym PC i w źródle przeglądarki."},
+		{L"Widgety", Icon::Preview, ID_NAV + (int)View::Widgets, L"Overlay, podgląd i edytor wyglądu."},
+		{L"Logi", Icon::Logs, ID_NAV + (int)View::Logs, L"Wpisy silnika i tej aplikacji."},
+		{L"O aplikacji", Icon::Info, ID_NAV + (int)View::About, L"Wersja programu i wtyczki, sprawdzanie aktualizacji."},
 	};
 	for (const NavEntry &e : views) {
 		Push(pad, y, itemW, S(40), e.label, e.id, kNone, true, e.tip, e.icon, BStyle::Nav, e.id - ID_NAV == (int)g_view);
@@ -997,14 +1167,20 @@ void LayoutBoard(float x, float y, float w, float bottom) {
 	const float rowH = S(32);
 	const float toggleW = S(80);
 	const float toggleH = S(26);
+	g_destTips.clear();
+	g_destTips.reserve(g_dests.size());
 	for (size_t i = 0; i < g_dests.size(); ++i) {
 		const float rowY = g_destsR.y + S(44) + rowH * (i + 1);
 		if (rowY + rowH > g_destsR.y + g_destsR.h)
 			break;
 		const bool on = g_dests[i].on;
+		std::wstring tip = on ? L"Zakończ stream tylko na tej platformie." : L"Zacznij wysyłać na tę platformę teraz.";
+		if (g_dests[i].state == "error")
+			tip = g_dests[i].name + L": " + DestErrorLong(g_dests[i]);
+		g_destTips.push_back(std::move(tip));
 		Push(g_destsR.x + g_destsR.w - pad - toggleW, rowY + (rowH - toggleH) * 0.5f, toggleW, toggleH,
-		     on ? L"Zakończ" : L"Live", ID_DEST + (int)i, on ? kRed : kGreen, g_connected,
-		     on ? L"Zakończ stream tylko na tej platformie." : L"Zacznij wysyłać na tę platformę teraz.", Icon::None);
+		     on ? L"Zakończ" : L"Live", ID_DEST + (int)i, on ? kRed : kGreen, g_connected, g_destTips.back().c_str(),
+		     Icon::None);
 	}
 }
 
@@ -1016,8 +1192,8 @@ void LayoutAddresses(float x, float y, float w, float bottom) {
 	const float bw = S(104);
 	const int ids[3] = {ID_COPY_RTMP, ID_COPY_INGEST, ID_COPY_OVERLAY};
 	const wchar_t *tips[3] = {
-		L"Skopiuj adres serwera do Streamlabs → Transmisja.",
-		L"Skopiuj klucz, którym Streamlabs publikuje do LiveDelay.",
+		L"Skopiuj adres serwera do ustawień transmisji.",
+		L"Skopiuj klucz, którym program na tym PC publikuje do LiveDelay.",
 		L"Skopiuj adres overlaya do źródła Przeglądarka.",
 	};
 	for (int i = 0; i < 3; ++i) {
@@ -1027,25 +1203,52 @@ void LayoutAddresses(float x, float y, float w, float bottom) {
 }
 
 void LayoutWidgets(float x, float y, float w, float bottom) {
-	(void)bottom;
-	const float gap = S(16);
-	const float tw = (w - gap) * 0.5f;
-	const float th = S(108);
-	struct Tile {
-		const wchar_t *name;
-		const wchar_t *note;
-		Icon icon;
+	const float gap = S(8);
+	const float bw = (w - 2 * gap) / 3.0f;
+	struct Tab {
+		const wchar_t *label;
 		int id;
+		WebPage page;
+		const wchar_t *tip;
 	};
-	const Tile tiles[] = {
-		{L"Podgląd", L"Obraz z wejścia i to, co widzą widzowie.", Icon::Preview, ID_PREVIEW},
-		{L"Overlay", L"Licznik opóźnienia dla widzów.", Icon::Overlay, ID_OVERLAY},
-		{L"Edytor wyglądu", L"Motyw, kolory i czcionka overlaya.", Icon::Theme, ID_THEME},
-		{L"Webpanel", L"Wszystkie opcje w przeglądarce.", Icon::Globe, ID_PANEL},
+	const Tab tabs[] = {
+		{L"Overlay", ID_OVERLAY, WebPage::Overlay, L"Licznik opóźnienia dla widzów. Adres wklejasz w źródło Przeglądarka."},
+		{L"Podgląd", ID_PREVIEW, WebPage::Preview, L"Obraz z tego PC i to, co widzą widzowie."},
+		{L"Motyw", ID_THEME, WebPage::Theme, L"Motyw, kolory i czcionka overlaya."},
 	};
-	for (int i = 0; i < 4; ++i)
-		Push(x + (i % 2) * (tw + gap), y + (i / 2) * (th + gap), tw, th, tiles[i].name, tiles[i].id, kAccent, true,
-		     L"Otworzy się w przeglądarce.", tiles[i].icon, BStyle::Tile, false, tiles[i].note);
+	for (int i = 0; i < 3; ++i) {
+		const bool on = g_webPage == tabs[i].page;
+		Push(x + i * (bw + gap), y, bw, S(36), tabs[i].label, tabs[i].id, on ? kAccent : kNone, true, tabs[i].tip, Icon::None,
+		     on ? BStyle::Solid : BStyle::Normal);
+	}
+	g_urlR = {x, y + S(36) + S(8), w, S(36)};
+	Push(g_urlR.x + g_urlR.w - S(8) - S(96), g_urlR.y + S(4), S(96), S(28), L"Kopiuj", ID_COPY_WIDGET, kNone, true,
+	     L"Skopiuj adres tej strony.", Icon::Copy);
+	const float top = g_urlR.y + g_urlR.h + S(8);
+	g_webR = {x, top, w, std::max(S(120.0f), bottom - top)};
+	if (WebFailed())
+		Push(g_webR.x, g_webR.y + S(28), S(240), S(36), L"Otwórz w przeglądarce", ID_WEB_FALLBACK, kNone, true,
+		     L"Okno podglądu jest niedostępne.", Icon::Globe);
+}
+
+void LayoutAbout(float x, float y, float w, float bottom) {
+	(void)bottom;
+	g_aboutR = {x, y, w, S(148)};
+	Push(x, y + S(148) + S(16), S(230), S(36), L"Sprawdź aktualizacje", ID_UPDATE_CHECK, kNone, !UpdateBusy(),
+	     L"Porównaj wersje z livedelay.vxh.pl.", Icon::None);
+	const float dy = y + S(148) + S(16) + S(36) + S(18);
+	g_dangerR = {x, dy, w, S(118)};
+	Push(x + S(18), dy + S(64), S(230), S(36), L"Odinstaluj aplikację", ID_DANGER_PICK, kRed, true,
+	     L"Zaznacz, a potem wykonaj. Ustawienia i klucze zostają.", Icon::None,
+	     g_dangerOn ? BStyle::Solid : BStyle::Normal, g_dangerOn);
+	Push(x + S(18) + S(238), dy + S(64), S(120), S(36), L"Wykonaj", ID_DANGER_RUN, kRed, g_dangerOn,
+	     L"Zamyka program i usuwa go z menu Start.", Icon::None);
+}
+
+void LayoutLogs(float x, float y, float w, float bottom) {
+	g_logR = {x, y, w, std::max(S(160), bottom - y)};
+	Push(g_logR.x + g_logR.w - S(18) - S(104), g_logR.y + S(14), S(104), S(32), L"Kopiuj", ID_COPY_LOGS, kNone, true,
+	     L"Skopiuj cały log do schowka.", Icon::Copy);
 }
 
 void Layout(int width, int height) {
@@ -1080,8 +1283,21 @@ void Layout(int width, int height) {
 
 	// A new view slides up into place rather than appearing.
 	Approach(g_viewSlide, 0.0f, 0.09f);
-	const float top = g_mainR.y + S(16) + S(40) + S(18) + g_viewSlide * S(16);
+	float top = g_mainR.y + S(16) + S(40) + S(18) + g_viewSlide * S(16);
 	const float bottom = g_footR.y - S(16);
+	g_bannerR = {};
+	if (UpdatePending()) {
+		const float bh = S(52);
+		g_bannerR = {px, top, pw, bh};
+		const float bw = S(112);
+		const float by = top + (bh - S(32)) * 0.5f;
+		const bool busy = UpdateBusy();
+		Push(px + pw - S(8) - bw * 2 - S(8), by, bw, S(32), UpdateActionLabel(), ID_UPDATE_GO, kAmber, !busy,
+		     L"Pobierz i uruchom ponownie. Transmisja z tego PC zostanie przerwana.", Icon::None, BStyle::Solid);
+		Push(px + pw - S(8) - bw, by, bw, S(32), L"Później", ID_UPDATE_LATER, kNone, !busy,
+		     L"Schowaj ten komunikat do następnej wersji.", Icon::None);
+		top += bh + S(12);
+	}
 	switch (g_view) {
 	case View::Addresses:
 		LayoutAddresses(px, top, pw, bottom);
@@ -1089,9 +1305,23 @@ void Layout(int width, int height) {
 	case View::Widgets:
 		LayoutWidgets(px, top, pw, bottom);
 		break;
+	case View::Logs:
+		LayoutLogs(px, top, pw, bottom);
+		break;
+	case View::About:
+		LayoutAbout(px, top, pw, bottom);
+		break;
 	default:
 		LayoutBoard(px, top, pw, bottom);
 		break;
+	}
+
+	if (g_view == View::Widgets && !WebFailed()) {
+		RECT r{(LONG)std::lround(g_webR.x), (LONG)std::lround(g_webR.y), (LONG)std::lround(g_webR.x + g_webR.w),
+		       (LONG)std::lround(g_webR.y + g_webR.h)};
+		WebShow(g_hwnd, WebUrl(), r);
+	} else {
+		WebHide();
 	}
 }
 
@@ -1250,7 +1480,7 @@ void PaintBoard() {
 	float cy = g_destsR.y + S(44) + rowH * 0.5f;
 	// The incoming feed is not a state, so it stays colourless.
 	FillDot(dotX, cy, S(4), g_input ? kMuted : kDim);
-	TextMid(nameX, cy, L"Ze Streamlabs", kText);
+	TextMid(nameX, cy, L"Z twojego PC", kText);
 	const std::wstring inRate = g_input ? Round(g_inKbps) + L" kb/s" : L"brak sygnału";
 	TextRight(stateRight, cy, inRate, kMuted, g_input ? Fnt::Mono : Fnt::Small);
 	DrawSparkline(kInputKey, stateRight - TextW(inRate, g_input ? Fnt::Mono : Fnt::Small) - S(12) - sparkW, cy, sparkW,
@@ -1278,8 +1508,8 @@ void PaintBoard() {
 
 void PaintAddresses() {
 	Card(g_addrR);
-	Text(g_addrR.x + S(18), g_addrR.y + S(16), L"DLA STREAMLABS I ŹRÓDŁA PRZEGLĄDARKI", kMuted, Fnt::Grp);
-	Text(g_addrR.x + S(18), g_addrR.y + S(34), L"Streamlabs → Ustawienia → Transmisja → własny serwer", kMuted, Fnt::Small);
+	Text(g_addrR.x + S(18), g_addrR.y + S(16), L"DLA PROGRAMU NA TYM PC I ŹRÓDŁA PRZEGLĄDARKI", kMuted, Fnt::Grp);
+	Text(g_addrR.x + S(18), g_addrR.y + S(34), L"Ustawienia → Transmisja → własny serwer. Klucz: ld0.", kMuted, Fnt::Small);
 
 	struct Row {
 		const wchar_t *label;
@@ -1300,6 +1530,52 @@ void PaintAddresses() {
 		Text(g_addrR.x + S(18), ry + S(26), rows[i].value, rows[i].colour, Fnt::Body);
 		TextRight(g_addrR.x + g_addrR.w - S(18) - S(104) - S(14), ry + S(26) + S(2), rows[i].note, kMuted, Fnt::Small);
 	}
+}
+
+void PaintLogs(int windowH) {
+	Card(g_logR);
+	Text(g_logR.x + S(18), g_logR.y + S(16), L"SILNIK I APLIKACJA", kMuted, Fnt::Grp);
+	Text(g_logR.x + S(18), g_logR.y + S(34), L"livedelay.dll i to okno. Klucze platform są wycinane.", kMuted, Fnt::Small);
+
+	const Rect clip = {g_logR.x + S(18), g_logR.y + S(62), g_logR.w - S(36), g_logR.h - S(80)};
+	const float lh = S(18);
+	const int visible = std::max(1, (int)(clip.h / lh));
+	const int total = (int)g_logView.size();
+	const int maxScroll = std::max(0, total - visible);
+	if (g_logStick)
+		g_logScroll = maxScroll;
+	if (g_logScroll < 0)
+		g_logScroll = 0;
+	if (g_logScroll >= maxScroll) {
+		g_logScroll = maxScroll;
+		g_logStick = true;
+	}
+
+	int sx = (int)clip.x;
+	int sy = windowH - (int)(clip.y + clip.h);
+	int sw = (int)clip.w;
+	int sh = (int)clip.h;
+	if (sx < 0)
+		sx = 0;
+	if (sy < 0)
+		sy = 0;
+	if (sw < 0)
+		sw = 0;
+	if (sh < 0)
+		sh = 0;
+	glEnable(GL_SCISSOR_TEST);
+	glScissor(sx, sy, sw, sh);
+	if (total == 0) {
+		Text(clip.x, clip.y, L"Brak wpisów w tej sesji.", kMuted, Fnt::Small);
+	} else {
+		for (int i = 0; i < visible && g_logScroll + i < total; ++i) {
+			std::wstring shown = g_logView[g_logScroll + i];
+			if (shown.size() > 220)
+				shown.resize(220);
+			Text(clip.x, clip.y + lh * i, shown, kText, Fnt::Mono);
+		}
+	}
+	glDisable(GL_SCISSOR_TEST);
 }
 
 void Paint() {
@@ -1332,7 +1608,7 @@ void Paint() {
 	const float logo = S(20);
 	DrawLogo(S(14), (g_topR.h - logo) * 0.5f, logo);
 	TextMid(S(14) + logo + S(10), g_topR.h * 0.5f, L"LiveDelay", kText, Fnt::Bold);
-	TextMid(S(14) + logo + S(10) + TextW(L"LiveDelay", Fnt::Bold) + S(10), g_topR.h * 0.5f, L"0.1", kDim, Fnt::Mono);
+	TextMid(S(14) + logo + S(10) + TextW(L"LiveDelay", Fnt::Bold) + S(10), g_topR.h * 0.5f, AppVersion(), kDim, Fnt::Mono);
 
 	// ---- sidebar ----
 	Fill(g_navR.x, g_navR.y, g_navR.w, g_navR.h, kPanel);
@@ -1359,12 +1635,56 @@ void Paint() {
 	FillDot(g_chipR.x + S(17), g_chipR.y + g_chipR.h * 0.5f, S(4), Alpha(StateColor(StateClass()), Pulse()));
 	TextMid(g_chipR.x + S(30), g_chipR.y + g_chipR.h * 0.5f, chip, kText, Fnt::Bold);
 
+	if (g_bannerR.h > 0) {
+		FillRound(g_bannerR.x, g_bannerR.y, g_bannerR.w, g_bannerR.h, S(10), Mix(kCard, kAmber, 0.22f));
+		StrokeRound(g_bannerR.x, g_bannerR.y, g_bannerR.w, g_bannerR.h, S(10), Mix(kLine, kAmber, 0.7f));
+		std::wstring banner = UpdateBannerText();
+		const float maxW = g_bannerR.w - S(24) - S(112) * 2 - S(16);
+		while (banner.size() > 8 && TextW(banner, Fnt::Body) > maxW)
+			banner.pop_back();
+		TextMid(g_bannerR.x + S(16), g_bannerR.y + g_bannerR.h * 0.5f, banner, kText, Fnt::Body);
+	}
+
 	switch (g_view) {
 	case View::Addresses:
 		PaintAddresses();
 		break;
 	case View::Widgets:
-		break; // the tiles are buttons
+		FillRound(g_urlR.x, g_urlR.y, g_urlR.w, g_urlR.h, S(8), kCard);
+		StrokeRound(g_urlR.x, g_urlR.y, g_urlR.w, g_urlR.h, S(8), kLine);
+		{
+			std::wstring url = PublicWebUrl();
+			const float maxW = g_urlR.w - S(120);
+			while (url.size() > 12 && TextW(url, Fnt::Small) > maxW) {
+				url.pop_back();
+				if (url.size() > 1)
+					url.back() = L'…';
+			}
+			TextMid(g_urlR.x + S(12), g_urlR.y + g_urlR.h * 0.5f, url, kText, Fnt::Small);
+		}
+		if (WebFailed())
+			Text(g_webR.x, g_webR.y, L"Podgląd w oknie jest niedostępny.", kMuted, Fnt::Small);
+		break;
+	case View::Logs:
+		PaintLogs(h);
+		break;
+	case View::About:
+		Card(g_aboutR);
+		{
+			const float x = g_aboutR.x + S(22);
+			float y = g_aboutR.y + S(28);
+			Text(x, y, L"Aplikacja", kMuted, Fnt::Body);
+			Text(x + S(170), y, AppVersion(), kText, Fnt::Bold);
+			y += S(36);
+			Text(x, y, L"Wtyczka", kMuted, Fnt::Body);
+			Text(x + S(170), y, PluginVersion(), kText, Fnt::Bold);
+			y += S(40);
+			Text(x, y, UpdateStatus(), kMuted, Fnt::Small);
+		}
+		Card(g_dangerR);
+		Text(g_dangerR.x + S(18), g_dangerR.y + S(16), L"Strefa niebezpieczna", kText, Fnt::Bold);
+		Text(g_dangerR.x + S(18), g_dangerR.y + S(40), L"Usuwa program. Ustawienia i klucze zostają.", kMuted, Fnt::Small);
+		break;
 	default:
 		PaintBoard();
 		break;
@@ -1432,11 +1752,22 @@ void OpenSettings() {
 	InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
+void OpenInApp(WebPage page) {
+	if (g_view != View::Widgets)
+		g_viewSlide = 1.0f;
+	g_view = View::Widgets;
+	g_webPage = page;
+	ShowWindow(g_hwnd, SW_SHOW);
+	SetForegroundWindow(g_hwnd);
+	InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
 void DoButton(int id) {
-	if (id >= ID_NAV && id < ID_NAV + 3) {
+	if (id >= ID_NAV && id < ID_NAV + (int)View::About + 1) {
 		if (g_view != (View)(id - ID_NAV))
 			g_viewSlide = 1.0f;
 		g_view = (View)(id - ID_NAV);
+		ShowWindow(g_hwnd, SW_SHOW);
 		InvalidateRect(g_hwnd, nullptr, FALSE);
 		return;
 	}
@@ -1495,19 +1826,32 @@ void DoButton(int id) {
 		Copy(g_hwnd, RtmpUrl());
 		break;
 	case ID_COPY_OVERLAY:
-		Copy(g_hwnd, OverlayUrl());
+	case ID_COPY_WIDGET:
+		Copy(g_hwnd, g_view == View::Widgets && id == ID_COPY_WIDGET ? PublicWebUrl() : OverlayUrl());
 		break;
 	case ID_COPY_INGEST:
 		Copy(g_hwnd, g_ingest);
 		break;
+	case ID_COPY_LOGS: {
+		std::wstring all;
+		for (const std::wstring &line : g_logView) {
+			all += line;
+			all += L"\r\n";
+		}
+		Copy(g_hwnd, all.empty() ? L"" : all);
+		break;
+	}
 	case ID_PREVIEW:
-		OpenUrl(PreviewUrl());
+		OpenInApp(WebPage::Preview);
 		break;
 	case ID_OVERLAY:
-		OpenUrl(OverlayUrl());
+		OpenInApp(WebPage::Overlay);
 		break;
 	case ID_THEME:
-		OpenUrl(ThemeUrl());
+		OpenInApp(WebPage::Theme);
+		break;
+	case ID_WEB_FALLBACK:
+		OpenUrl(WebUrl());
 		break;
 	case ID_HELP:
 		OpenUrl(kHelpUrl);
@@ -1517,6 +1861,25 @@ void DoButton(int id) {
 		break;
 	case ID_SETTINGS:
 		OpenSettings();
+		break;
+	case ID_UPDATE_GO:
+		UpdateApply(g_hwnd);
+		break;
+	case ID_UPDATE_LATER:
+		UpdateLater();
+		break;
+	case ID_UPDATE_CHECK:
+		if (g_view != View::About)
+			g_viewSlide = 1.0f;
+		g_view = View::About;
+		UpdateCheckNow();
+		break;
+	case ID_DANGER_PICK:
+		g_dangerOn = !g_dangerOn;
+		break;
+	case ID_DANGER_RUN:
+		if (g_dangerOn)
+			UninstallApp(g_hwnd);
 		break;
 	default:
 		break;
@@ -1641,7 +2004,7 @@ void TrayMenu() {
 	if (!g_connected)
 		detail = L"Silnik nie odpowiada na " + g_api;
 	else if (!g_input)
-		detail = L"Brak sygnału ze Streamlabs";
+		detail = L"Brak sygnału z tego PC";
 	else
 		detail = L"Wejście " + Round(g_inKbps) + L" kb/s";
 	if (g_connected && g_armDelay > 0)
@@ -1672,13 +2035,14 @@ void TrayMenu() {
 	}
 
 	MenuSep(menu);
-	MenuAdd(menu, ID_PREVIEW, L"Podgląd", true);
 	MenuAdd(menu, ID_OVERLAY, L"Overlay", true);
 	MenuAdd(menu, ID_COPY_OVERLAY, L"Kopiuj adres overlaya", true);
+	MenuAdd(menu, ID_PREVIEW, L"Podgląd", true);
 	MenuAdd(menu, ID_THEME, L"Edytor motywu", true);
 	MenuAdd(menu, ID_PANEL, L"Webpanel", true);
 	MenuSep(menu);
 	MenuAdd(menu, ID_SHOW, L"Pokaż okno", true);
+	MenuAdd(menu, ID_NAV + (int)View::About, L"O aplikacji", true);
 	MenuAdd(menu, ID_SETTINGS, L"Ustawienia…", true);
 	MenuAdd(menu, ID_QUIT, L"Zakończ", true);
 	SetMenuDefaultItem(menu, ID_SHOW, FALSE);
@@ -1925,11 +2289,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		else if (wp == HOTKEY_CUT_AFTER)
 			DoButton(ID_CUT_AFTER);
 		return 0;
+	case WM_LD_UPDATE:
+		if (wp == 1)
+			DestroyWindow(hwnd);
+		else
+			InvalidateRect(hwnd, nullptr, FALSE);
+		return 0;
 	case WM_TIMER:
 		if (wp == 2) { // the frame clock: redraw, nothing else
 			InvalidateRect(hwnd, nullptr, FALSE);
 			return 0;
 		}
+		UpdatePoll();
 		WatchIni();
 		Refresh();
 		Sample();
@@ -1951,6 +2322,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		InvalidateRect(hwnd, nullptr, FALSE);
 		return 0;
 	}
+	case WM_MOUSEWHEEL:
+		if (g_view == View::Logs) {
+			g_logStick = false;
+			g_logScroll -= GET_WHEEL_DELTA_WPARAM(wp) / 40;
+			InvalidateRect(hwnd, nullptr, FALSE);
+		}
+		return 0;
 	case WM_MOUSEMOVE: {
 		if (!g_tracking) {
 			TRACKMOUSEEVENT tme{};
@@ -2006,6 +2384,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 			DrawMenuItem((DRAWITEMSTRUCT *)lp);
 			return TRUE;
 		}
+		return DefWindowProcW(hwnd, msg, wp, lp);
+	case WM_NCACTIVATE:
+		// lParam -1 keeps DefWindowProc from repainting the system frame.
+		SuppressSystemFrame(hwnd);
+		return DefWindowProcW(hwnd, WM_NCACTIVATE, wp, -1);
+	case WM_NCPAINT:
+		return 0;
+	case WM_ACTIVATE:
+		SuppressSystemFrame(hwnd);
 		return DefWindowProcW(hwnd, msg, wp, lp);
 	case WM_NCCALCSIZE:
 		// The client area covers the whole window, caption included: the title
@@ -2104,10 +2491,12 @@ bool ReloadEngine() {
 		char msg[512] = {};
 		if (g_lastErr)
 			g_lastErr(msg, sizeof msg);
+		AppLog(L"nie udało się przeładować silnika");
 		MessageBoxW(g_hwnd, Utf8(msg[0] ? msg : "Nie udało się uruchomić silnika z nowymi ustawieniami.").c_str(),
 			    L"LiveDelay", MB_OK | MB_ICONWARNING);
 		return false;
 	}
+	AppLog(L"przeładowano silnik");
 	g_delaySet = false;
 	Refresh();
 	InvalidateRect(g_hwnd, nullptr, FALSE);
@@ -2138,6 +2527,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 	std::wstring dir = std::wstring(appdata) + L"\\LiveDelay";
 	CreateDirectoryW(dir.c_str(), nullptr);
 	SetIniPath(dir + L"\\livedelay.ini");
+	AppLog(L"aplikacja uruchomiona");
 
 	EngineLoad engine = LoadEngine();
 	if (engine == EngineLoad::Missing) {
@@ -2170,10 +2560,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
 	// No system caption: WM_NCCALCSIZE hands the whole window to us, while
 	// WS_THICKFRAME keeps resizing, snapping and the drop shadow.
-	const DWORD style = WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU;
+	const DWORD style = WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU | WS_CLIPCHILDREN;
 	// WS_POPUP alone would drop the window off the taskbar.
 	g_hwnd = CreateWindowExW(WS_EX_APPWINDOW, wc.lpszClassName, L"LiveDelay", style, CW_USEDEFAULT, CW_USEDEFAULT,
 				 Si(920), Si(620), nullptr, nullptr, inst, nullptr);
+	SuppressSystemFrame(g_hwnd);
 
 	g_dc = GetDC(g_hwnd);
 	PIXELFORMATDESCRIPTOR pfd{};
@@ -2189,6 +2580,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 	MakeFonts();
 
 	AddTray();
+	UpdateBind(g_hwnd);
 	ShowWindow(g_hwnd, SW_SHOW);
 	Refresh();
 	Sample();
