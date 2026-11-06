@@ -84,8 +84,10 @@ const Ingest kYouTubeIn[] = {
 	{L"Zapasowy", L"rtmp://b.rtmp.youtube.com/live2?backup=1"},
 	{L"Główny przez RTMPS", L"rtmps://a.rtmps.youtube.com/live2"},
 };
+// Kick gives every channel its own host. A shared one connects and then drops
+// the stream, so the field stays empty until the user pastes theirs.
 const Ingest kKickIn[] = {
-	{L"Główny", L"rtmps://fa723fc1b171.global-contribute.live-video.net/app"},
+	{L"Z panelu Kick", L""},
 };
 const Ingest kFacebookIn[] = {
 	{L"Główny", L"rtmps://live-api-s.facebook.com:443/rtmp/"},
@@ -887,7 +889,7 @@ void MatchUrl(const std::wstring &url, int &service, int &server) {
 	server = -1;
 	for (int s = 0; s < kServiceCount; ++s)
 		for (int n = 0; n < kServices[s].count; ++n)
-			if (url == kServices[s].ingests[n].url) {
+			if (kServices[s].ingests[n].url[0] && url == kServices[s].ingests[n].url) {
 				service = s;
 				server = n;
 				return;
@@ -1414,8 +1416,13 @@ void OnCommand(int id, int code) {
 		const int pickIndex = Pick(Of(IDC_SERVICE), names, service < 0 ? kServiceCount : service);
 		if (pickIndex < 0)
 			break;
-		if (pickIndex < kServiceCount)
-			Set(IDC_URL, kServices[pickIndex].ingests[0].url); // first ingest of that service
+		if (pickIndex < kServiceCount) {
+			const wchar_t *fill = kServices[pickIndex].ingests[0].url;
+			if (fill[0])
+				Set(IDC_URL, fill);
+			else if (service != pickIndex)
+				Set(IDC_URL, L""); // Kick: no shared address, drop the previous platform's
+		}
 		ShowServiceLabels();
 		break;
 	}
@@ -1428,7 +1435,7 @@ void OnCommand(int id, int code) {
 		for (int n = 0; n < kServices[service].count; ++n)
 			names.push_back(kServices[service].ingests[n].label);
 		const int pickIndex = Pick(Of(IDC_SERVER), names, server);
-		if (pickIndex >= 0)
+		if (pickIndex >= 0 && kServices[service].ingests[pickIndex].url[0])
 			Set(IDC_URL, kServices[service].ingests[pickIndex].url);
 		ShowServiceLabels();
 		break;
