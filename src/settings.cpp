@@ -320,9 +320,14 @@ std::wstring Trim(const std::wstring &s) {
 
 // ---------------------------------------------------------------- ini as blocks
 
+// The ini has more than one kind of section now, and anything we do not know
+// has to survive a save untouched.
+enum class Section { Top, Dest, Input, Other };
+
 struct Block {
-	std::string header; // "[dest Twitch]"; empty for the lines before the first platform
+	std::string header; // "[dest Twitch]"; empty for the lines before the first section
 	std::vector<std::string> lines;
+	Section kind = Section::Top;
 };
 
 std::string TrimAscii(const std::string &s) {
@@ -346,6 +351,37 @@ bool SplitKey(const std::string &line, std::string &key, std::string &value) {
 	return !key.empty();
 }
 
+/// "[dest Twitch]" asked for "dest" gives "Twitch"; a section of another kind
+/// gives nothing.
+std::string SectionName(const std::string &header, const char *word) {
+	const std::string t = TrimAscii(header);
+	if (t.size() < 3 || t.front() != '[' || t.back() != ']')
+		return {};
+	const std::string inner = TrimAscii(t.substr(1, t.size() - 2));
+	const size_t n = strlen(word);
+	if (inner.size() <= n || inner.compare(0, n, word) != 0 || !std::isspace((unsigned char)inner[n]))
+		return {};
+	return TrimAscii(inner.substr(n));
+}
+
+std::string DestName(const std::string &header) {
+	return SectionName(header, "dest");
+}
+
+std::string InputName(const std::string &header) {
+	return SectionName(header, "input");
+}
+
+Section SectionOf(const std::string &header) {
+	if (TrimAscii(header).empty())
+		return Section::Top;
+	if (!DestName(header).empty())
+		return Section::Dest;
+	if (!InputName(header).empty())
+		return Section::Input;
+	return Section::Other;
+}
+
 std::vector<Block> SplitIni(const std::string &text) {
 	std::vector<Block> blocks(1);
 	size_t p = 0;
@@ -355,8 +391,8 @@ std::vector<Block> SplitIni(const std::string &text) {
 		if (!line.empty() && line.back() == '\r')
 			line.pop_back();
 		std::string t = TrimAscii(line);
-		if (t.rfind("[dest", 0) == 0 && t.back() == ']')
-			blocks.push_back({line, {}});
+		if (t.size() >= 3 && t.front() == '[' && t.back() == ']')
+			blocks.push_back({line, {}, SectionOf(line)});
 		else if (!(nl == std::string::npos && t.empty()))
 			blocks.back().lines.push_back(line);
 		if (nl == std::string::npos)
@@ -411,12 +447,6 @@ bool Yes(const std::string &v) {
 	return t == "yes" || t == "tak" || t == "true" || t == "1" || t == "on";
 }
 
-std::string DestName(const std::string &header) {
-	std::string t = TrimAscii(header);
-	if (t.size() < 7)
-		return {};
-	return TrimAscii(t.substr(5, t.size() - 6)); // between "[dest" and "]"
-}
 
 // ---------------------------------------------------------------- overlay document
 
@@ -992,6 +1022,8 @@ void ReadEverything() {
 
 	g_rows.clear();
 	for (size_t i = 1; i < blocks.size(); ++i) {
+		if (blocks[i].kind != Section::Dest)
+			continue;
 		DestRow d;
 		d.name = Utf8(DestName(blocks[i].header));
 		d.fileName = d.name;
@@ -1043,13 +1075,19 @@ std::string BuildIni() {
 	for (int i = 0; i < 4; ++i)
 		SetLineKey(out[0].lines, kHotkeyKey[i], WideUtf8(Trim(Get(IDC_HOTKEY + i))));
 
+	// Sections this window does not own — inputs, and whatever a newer build or
+	// the panel wrote — go back untouched, before the platforms.
+	for (const Block &b : blocks)
+		if (b.kind == Section::Input || b.kind == Section::Other)
+			out.push_back(b);
+
 	for (const DestRow &d : g_rows) {
 		Block b;
 		// Match by the section name this row was read under, so a rename here or
 		// a reorder there still lands on the right block.
 		if (!d.fileName.empty())
 			for (size_t i = 1; i < blocks.size(); ++i)
-				if (Utf8(DestName(blocks[i].header)) == d.fileName) {
+				if (blocks[i].kind == Section::Dest && Utf8(DestName(blocks[i].header)) == d.fileName) {
 					b = blocks[i];
 					break;
 				}
