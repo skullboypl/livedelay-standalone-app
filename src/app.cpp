@@ -69,6 +69,8 @@ constexpr int HOTKEY_CUT = 0x4C03;
 constexpr int HOTKEY_CUT_AFTER = 0x4C04;
 // One per platform row: ID_DEST + index.
 constexpr int ID_DEST = 200;
+// One per input row: copy that input's key.
+constexpr int ID_IN_KEY = 300;
 
 constexpr const wchar_t *kHelpUrl = L"https://livedelay.vxh.pl/";
 // The only resource in app.rc: the site's mark, in every size Windows asks for.
@@ -123,6 +125,7 @@ double g_inKbps = 0;
 
 struct Dest {
 	std::wstring name;
+	std::wstring input; // name of the input it is fed by
 	std::string state;
 	std::wstring error;
 	double kbps = 0;
@@ -130,6 +133,26 @@ struct Dest {
 };
 
 std::vector<Dest> g_dests;
+
+// One per ingest the engine listens on. A platform names the input it is fed by.
+struct Input {
+	std::wstring name;
+	std::wstring key;
+	bool live = false;
+	double kbps = 0;
+	bool delayed = false;
+	bool armed = false;
+	double armDelay = -1;
+	double bufferS = 0;
+	double bufferMb = 0;
+	int width = 0;
+	int height = 0;
+};
+
+std::vector<Input> g_inputs;
+/// False when /state carries no "inputs" array: an engine too old to know them.
+/// Everything about inputs stays hidden then, and nothing writes [input …].
+bool g_hasInputs = false;
 std::vector<std::wstring> g_destTips;
 
 // One bitrate sample a second per line, same as the dock's sparkline.
@@ -157,7 +180,7 @@ std::unordered_map<std::wstring, Glyph> g_text;
 
 enum class Icon {
 	None, Arm, Activate, Live, LiveAfter, Disarm, Settings, Preview, Overlay, Theme, Copy, Help, Gauge, Globe, Link,
-	Logs, Info, Collapse, WinMin, WinMax, WinClose
+	Logs, Info, Collapse, WinMin, WinMax, WinClose, Ingest
 };
 
 // Normal is the outlined button; Solid is the one action that matters right
@@ -184,7 +207,7 @@ struct Rect {
 	float x = 0, y = 0, w = 0, h = 0;
 };
 
-enum class View { Board, Addresses, Widgets, Logs, About };
+enum class View { Board, Inputs, Addresses, Widgets, Logs, About };
 enum class WebPage { Preview, Overlay, Theme };
 
 WebPage g_webPage = WebPage::Overlay;
@@ -242,7 +265,7 @@ float Approach(float &v, float target, float tau = 0.085f) {
 Rect g_topR;
 Rect g_navR, g_mainR, g_footR, g_chipR, g_bannerR, g_urlR, g_aboutR, g_dangerR;
 bool g_dangerOn = false;
-Rect g_stateR, g_ctrlR, g_destsR, g_addrR, g_barR, g_delayBoxR, g_logR, g_webR;
+Rect g_stateR, g_ctrlR, g_destsR, g_addrR, g_barR, g_delayBoxR, g_logR, g_webR, g_inputsR;
 float g_titleY = 0;
 float g_grpY = 0;
 bool g_showBar = false;
@@ -282,21 +305,53 @@ void ParseState(const std::string &j) {
 		g_delay = std::clamp((int)std::lround(d), 1, 3600);
 	}
 
+	g_inputs.clear();
+	const size_t inAt = j.find("\"inputs\":[");
+	g_hasInputs = inAt != std::string::npos;
+	const size_t destAt = j.find("\"dests\":[");
+	if (inAt != std::string::npos) {
+		size_t p = inAt;
+		const size_t end = destAt == std::string::npos ? j.size() : destAt;
+		while ((p = j.find("\"name\":\"", p)) != std::string::npos && p < end) {
+			Input in;
+			in.name = Utf8(JsonString(j, "name", p));
+			in.key = Utf8(JsonString(j, "key", p));
+			in.live = JsonBool(j, "input", p);
+			in.kbps = JsonNumber(j, "in_kbps", 0, p);
+			in.delayed = JsonString(j, "mode", p) == "delayed";
+			in.armed = JsonBool(j, "armed", p);
+			in.armDelay = JsonNumber(j, "arm_delay", -1, p);
+			in.bufferS = JsonNumber(j, "buffer_s", 0, p);
+			in.bufferMb = JsonNumber(j, "buffer_mb", 0, p);
+			in.width = (int)JsonNumber(j, "width", 0, p);
+			in.height = (int)JsonNumber(j, "height", 0, p);
+			if (!in.name.empty())
+				g_inputs.push_back(in);
+			p += 8;
+			if (g_inputs.size() >= 16)
+				break;
+		}
+	}
+
 	g_dests.clear();
-	size_t p = 0;
-	// "name" is the first key of every destination object.
-	while ((p = j.find("\"name\":\"", p)) != std::string::npos) {
-		Dest d;
-		d.name = Utf8(JsonString(j, "name", p));
-		d.state = JsonString(j, "state", p);
-		d.error = Utf8(JsonString(j, "error", p));
-		d.kbps = JsonNumber(j, "kbps", 0, p);
-		d.on = JsonBool(j, "on", p);
-		if (!d.name.empty())
-			g_dests.push_back(d);
-		p += 8;
-		if (g_dests.size() >= 8)
-			break;
+	// Inputs carry a "name" too and come first, so platforms are read from the
+	// dests array alone, not from wherever "name" happens to appear.
+	if (destAt != std::string::npos) {
+		size_t p = destAt;
+		while ((p = j.find("\"name\":\"", p)) != std::string::npos) {
+			Dest d;
+			d.name = Utf8(JsonString(j, "name", p));
+			d.input = Utf8(JsonString(j, "input", p));
+			d.state = JsonString(j, "state", p);
+			d.error = Utf8(JsonString(j, "error", p));
+			d.kbps = JsonNumber(j, "kbps", 0, p);
+			d.on = JsonBool(j, "on", p);
+			if (!d.name.empty())
+				g_dests.push_back(d);
+			p += 8;
+			if (g_dests.size() >= 16)
+				break;
+		}
 	}
 }
 
@@ -309,6 +364,8 @@ void Offline() {
 	g_armDelay = -1;
 	g_inKbps = 0;
 	g_dests.clear();
+	g_inputs.clear();
+	g_hasInputs = false;
 }
 
 std::string g_engineRaw;
@@ -694,6 +751,12 @@ void DrawIcon(Icon kind, float x, float y, float size, Col c) {
 		Stroke(px(9), py(12), px(14), py(17), c, t);
 		Stroke(px(18), py(6), px(18), py(18), c, t);
 		break;
+	case Icon::Ingest: // an arrow going into a box
+		StrokeRound(px(10), py(4), 11 * u, 16 * u, 2 * u, c, t);
+		Stroke(px(3), py(12), px(12), py(12), c, t);
+		Stroke(px(9), py(9), px(12), py(12), c, t);
+		Stroke(px(9), py(15), px(12), py(12), c, t);
+		break;
 	case Icon::WinMin:
 		Stroke(px(5), py(12), px(19), py(12), c, t);
 		break;
@@ -1061,6 +1124,8 @@ std::wstring BigNumber(std::wstring &caption) {
 
 std::wstring ViewTitle() {
 	switch (g_view) {
+	case View::Inputs:
+		return L"Wejścia";
 	case View::Addresses:
 		return L"Adresy";
 	case View::Widgets:
@@ -1090,12 +1155,16 @@ void LayoutNav(float height) {
 
 	const NavEntry views[] = {
 		{L"Pulpit", Icon::Gauge, ID_NAV + (int)View::Board, L"Stan, opóźnienie i platformy."},
+		{L"Wejścia", Icon::Ingest, ID_NAV + (int)View::Inputs, L"Strumienie, które do ciebie przychodzą, i ich klucze."},
 		{L"Adresy", Icon::Link, ID_NAV + (int)View::Addresses, L"Co wkleić w programie na tym PC i w źródle przeglądarki."},
 		{L"Widgety", Icon::Preview, ID_NAV + (int)View::Widgets, L"Overlay, podgląd i edytor wyglądu."},
 		{L"Logi", Icon::Logs, ID_NAV + (int)View::Logs, L"Wpisy silnika i tej aplikacji."},
 		{L"O aplikacji", Icon::Info, ID_NAV + (int)View::About, L"Wersja programu i wtyczki, sprawdzanie aktualizacji."},
 	};
 	for (const NavEntry &e : views) {
+		// An engine too old to know inputs gets no entry for them.
+		if (e.id - ID_NAV == (int)View::Inputs && !g_hasInputs)
+			continue;
 		Push(pad, y, itemW, S(40), e.label, e.id, kNone, true, e.tip, e.icon, BStyle::Nav, e.id - ID_NAV == (int)g_view);
 		y += S(41);
 	}
@@ -1202,6 +1271,19 @@ void LayoutAddresses(float x, float y, float w, float bottom) {
 	}
 }
 
+constexpr float kInputCard = 96;
+
+void LayoutInputs(float x, float y, float w, float bottom) {
+	g_inputsR = {x, y, w, std::max(S(kInputCard), bottom - y)};
+	for (size_t i = 0; i < g_inputs.size(); ++i) {
+		const float cy = y + i * (S(kInputCard) + S(12));
+		if (cy + S(kInputCard) > bottom)
+			break;
+		Push(x + w - S(18) - S(136), cy + S(kInputCard) - S(16) - S(30), S(136), S(30), L"Kopiuj klucz",
+		     ID_IN_KEY + (int)i, kNone, true, L"Skopiuj klucz, którym publikuje się na to wejście.", Icon::Copy);
+	}
+}
+
 void LayoutWidgets(float x, float y, float w, float bottom) {
 	const float gap = S(8);
 	const float bw = (w - 2 * gap) / 3.0f;
@@ -1299,6 +1381,9 @@ void Layout(int width, int height) {
 		top += bh + S(12);
 	}
 	switch (g_view) {
+	case View::Inputs:
+		LayoutInputs(px, top, pw, bottom);
+		break;
 	case View::Addresses:
 		LayoutAddresses(px, top, pw, bottom);
 		break;
@@ -1506,6 +1591,48 @@ void PaintBoard() {
 	}
 }
 
+void PaintInputs() {
+	if (g_inputs.empty()) {
+		Card(g_inputsR);
+		TextMid(g_inputsR.x + S(24), g_inputsR.y + S(34),
+			g_connected ? L"Silnik nie zgłasza żadnego wejścia." : L"Silnik nie odpowiada.", kMuted, Fnt::Small);
+		return;
+	}
+	for (size_t i = 0; i < g_inputs.size(); ++i) {
+		const Input &in = g_inputs[i];
+		const Rect c = {g_inputsR.x, g_inputsR.y + i * (S(kInputCard) + S(12)), g_inputsR.w, S(kInputCard)};
+		if (c.y + c.h > g_inputsR.y + g_inputsR.h)
+			break;
+		Card(c);
+		const Col state = !in.live ? kDim : in.delayed ? kRed : (in.armed || in.armDelay > 0) ? kAmber : kGreen;
+		FillRound(c.x + S(10), c.y + S(14), S(4), c.h - S(28), S(2), Alpha(state, in.live ? Pulse() : 1.0f));
+
+		Text(c.x + S(28), c.y + S(16), in.name, kText, Fnt::Title);
+		// The key is what someone pastes, so it gets the figures face.
+		TextMid(c.x + S(28) + TextW(in.name, Fnt::Title) + S(12), c.y + S(28), in.key, kMuted, Fnt::Mono);
+
+		std::wstring line = RtmpUrl();
+		TextMid(c.x + S(28), c.y + S(56), line, kGreen, Fnt::Small);
+
+		std::wstring right = L"brak sygnału";
+		if (in.live) {
+			right = Round(in.kbps) + L" kb/s";
+			if (in.width > 0 && in.height > 0)
+				right += L"  ·  " + std::to_wstring(in.width) + L"×" + std::to_wstring(in.height);
+		}
+		TextRight(c.x + c.w - S(18), c.y + S(28), right, in.live ? kText : kMuted, Fnt::Mono);
+		if (in.armDelay > 0)
+			TextRight(c.x + c.w - S(18), c.y + S(50), L"bufor " + Tenth(in.bufferS) + L" s", kMuted, Fnt::Small);
+
+		// Which platforms this input feeds.
+		std::wstring fed;
+		for (const Dest &d : g_dests)
+			if (d.input == in.name)
+				fed += (fed.empty() ? L"" : L"  ·  ") + d.name;
+		TextMid(c.x + S(28), c.y + S(78), fed.empty() ? L"żadna platforma z tego nie korzysta" : fed, kMuted, Fnt::Small);
+	}
+}
+
 void PaintAddresses() {
 	Card(g_addrR);
 	Text(g_addrR.x + S(18), g_addrR.y + S(16), L"DLA PROGRAMU NA TYM PC I ŹRÓDŁA PRZEGLĄDARKI", kMuted, Fnt::Grp);
@@ -1646,6 +1773,9 @@ void Paint() {
 	}
 
 	switch (g_view) {
+	case View::Inputs:
+		PaintInputs();
+		break;
 	case View::Addresses:
 		PaintAddresses();
 		break;
