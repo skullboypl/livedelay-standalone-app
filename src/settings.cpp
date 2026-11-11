@@ -494,6 +494,109 @@ bool Yes(const std::string &v) {
 	return t == "yes" || t == "tak" || t == "true" || t == "1" || t == "on";
 }
 
+// ---------------------------------------------------------------- adding an input
+//
+// The wizard in the main window needs one input more, without opening this
+// window. It is the same file and the same rules, so the writing lives here.
+
+bool LooksLikeLdKey(const std::string &key, int &number) {
+	if (key.size() < 3 || key.compare(0, 2, "ld") != 0)
+		return false;
+	if (key.find_first_not_of("0123456789", 2) != std::string::npos)
+		return false;
+	number = std::atoi(key.c_str() + 2);
+	return true;
+}
+
+/// The lowest ld… nobody is publishing on yet.
+std::string FreeIngest(const std::vector<Block> &a, const std::vector<Block> &b) {
+	int top = -1;
+	for (const std::vector<Block> *set : {&a, &b})
+		for (const Block &blk : *set) {
+			std::string key;
+			if (blk.kind == Section::Input)
+				key = BlockValue(blk, "key");
+			else if (blk.kind == Section::Dest)
+				key = BlockValue(blk, "ingest_key");
+			int n = 0;
+			if (!key.empty() && LooksLikeLdKey(key, n))
+				top = std::max(top, n);
+		}
+	return "ld" + std::to_string(top + 1);
+}
+
+/// Writes one more `[input …]` into the ini and returns the name it got, or
+/// nothing when the file could not be written.
+std::wstring MakeInput(const std::wstring &wanted) {
+	const std::string text = LoadText(g_ini);
+	if (text.empty())
+		return {};
+	std::vector<Block> blocks = SplitIni(text);
+	const char *eol = text.find("\r\n") != std::string::npos ? "\r\n" : "\n";
+
+	bool any = false;
+	for (const Block &b : blocks)
+		if (b.kind == Section::Input)
+			any = true;
+
+	// A file with no inputs at all runs on what the engine makes up: one input
+	// per platform, named after it, on its ingest key. That has to be written
+	// down before anything is added to it — otherwise the new section would be
+	// the only input in the file and every platform would point at nothing.
+	std::vector<Block> made;
+	auto taken = [&](const std::string &name) {
+		for (const std::vector<Block> *set : {&blocks, &made})
+			for (const Block &b : *set)
+				if (b.kind == Section::Input && InputName(b.header) == name)
+					return true;
+		return false;
+	};
+	if (!any) {
+		int i = 0;
+		for (Block &b : blocks) {
+			if (b.kind != Section::Dest)
+				continue;
+			std::string name = DestName(b.header);
+			std::string key = BlockValue(b, "ingest_key");
+			if (key.empty())
+				key = "ld" + std::to_string(i);
+			++i;
+			for (int n = 2; taken(name); ++n)
+				name = DestName(b.header) + " " + std::to_string(n);
+			Block in;
+			in.kind = Section::Input;
+			in.header = "[input " + name + "]";
+			in.lines.push_back("key = " + key);
+			in.lines.push_back("");
+			made.push_back(in);
+			SetLineKey(b.lines, "input", name);
+			DropLineKey(b.lines, "ingest_key");
+		}
+	}
+
+	std::string name = WideUtf8(wanted);
+	for (int n = 2; taken(name); ++n)
+		name = WideUtf8(wanted) + " " + std::to_string(n);
+
+	Block fresh;
+	fresh.kind = Section::Input;
+	fresh.header = "[input " + name + "]";
+	fresh.lines.push_back("key = " + FreeIngest(blocks, made));
+	fresh.lines.push_back("");
+
+	std::vector<Block> out = blocks;
+	EndWithBlank(out.back().lines);
+	for (const Block &b : made)
+		out.push_back(b);
+	out.push_back(fresh);
+
+	if (!StoreText(g_ini + L".bak", text))
+		return {};
+	if (!StoreText(g_ini, JoinIni(out, eol)))
+		return {};
+	return Utf8(name);
+}
+
 
 // ---------------------------------------------------------------- overlay document
 
@@ -1879,6 +1982,10 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 } // namespace
+
+std::wstring AddInput(const std::wstring &name) {
+	return MakeInput(name);
+}
 
 bool ShowSettings(HWND owner) {
 	static bool registered = false;

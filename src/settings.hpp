@@ -12,6 +12,14 @@ namespace ld {
 /// Opens the settings window and returns once it closes. True if anything was saved.
 bool ShowSettings(HWND owner);
 
+/// Adds an `[input …]` section to the ini without opening the window: the
+/// wizard's one click. When the file has no inputs yet, the ones the engine
+/// synthesises today are written down first, so every platform keeps the feed
+/// it has. Returns the name the input got — it may differ from the one asked
+/// for, when that one is taken — or nothing when the file could not be written.
+/// The caller reloads the engine; this only touches the file.
+std::wstring AddInput(const std::wstring &name);
+
 /// Restarts the engine with the ini as it is on disk. Defined by the app window,
 /// which owns the DLL. Returns false and shows the reason on failure.
 bool ReloadEngine();

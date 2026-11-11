@@ -61,6 +61,16 @@ constexpr int ID_UPDATE_LATER = 131;
 constexpr int ID_UPDATE_CHECK = 132;
 constexpr int ID_DANGER_PICK = 133;
 constexpr int ID_DANGER_RUN = 134;
+
+// The vertical-stream wizard, on the Wejścia page.
+constexpr int ID_WIZ = 140;
+constexpr int ID_WIZ_CLOSE = 141;
+constexpr int ID_WIZ_BACK = 142;
+constexpr int ID_WIZ_NEXT = 143;
+constexpr int ID_WIZ_MAKE = 144;
+constexpr int ID_WIZ_URL = 145;
+constexpr int ID_WIZ_KEY = 146;
+constexpr int ID_WIZ_DESTS = 147;
 // One per sidebar entry that switches the view: ID_NAV + View.
 constexpr int ID_NAV = 120;
 constexpr int HOTKEY_ARM = 0x4C01;
@@ -245,6 +255,19 @@ std::wstring WebUrl() {
 
 View g_view = View::Board;
 bool g_navMin = false;
+
+// ---------------------------------------------------------------- the wizard
+//
+// Four steps on the Wejścia page, for the one case almost everybody wants: a
+// second, vertical stream next to the horizontal one. Step one of the written
+// design — "what makes the vertical picture" — belongs to the OBS plugin, which
+// can ask OBS what it loaded; here a sentence does that job.
+
+constexpr int kWizSteps = 4;
+int g_wizStep = 0; // 0 is closed
+std::wstring g_wizName = L"Pionowe";
+std::wstring g_wizNote;
+int g_wizBufferMb = 0;
 
 // ---------------------------------------------------------------- motion
 //
@@ -1333,10 +1356,84 @@ void LayoutAddresses(float x, float y, float w, float bottom) {
 
 constexpr float kInputCard = 96;
 
+// ---------------------------------------------------------------- the wizard
+
+/// The input the wizard is working on, once it exists.
+const Input *WizInput() {
+	for (const Input &in : g_inputs)
+		if (in.name == g_wizName)
+			return &in;
+	return nullptr;
+}
+
+/// How much of the delay buffer one input gets: the whole budget divided by the
+/// number of inputs, in seconds at the rate actually coming in.
+std::wstring WizBufferLine() {
+	const int n = std::max<int>(1, (int)g_inputs.size());
+	const double kbps = g_inKbps > 100 ? g_inKbps : 6000;
+	if (g_wizBufferMb <= 0)
+		return {};
+	const int seconds = (int)(g_wizBufferMb * 8000.0 / kbps / n);
+	return L"Bufor " + std::to_wstring(g_wizBufferMb) + L" MB dzieli się na " + std::to_wstring(n) +
+	       (n == 1 ? L" wejście" : n < 5 ? L" wejścia" : L" wejść") + L" — około " + std::to_wstring(seconds) +
+	       L" s na każde przy " + Round(kbps) + L" kb/s" + (g_inKbps > 100 ? L"." : L" (szacunek).");
+}
+
+void ReadWizBuffer() {
+	g_wizBufferMb = _wtoi(IniLine(LoadText(g_ini), "max_buffer_mb").c_str());
+}
+
+Rect g_wizR, g_wizRowR;
+
+void LayoutWizard(float x, float y, float w, float bottom) {
+	// Each step is as tall as what it has to say, never taller than the page.
+	const float want[kWizSteps] = {S(250), S(336), S(286), S(372)};
+	g_wizR = {x, y, w, std::min(want[std::clamp(g_wizStep, 1, kWizSteps) - 1], std::max(S(250), bottom - y))};
+	const float by = g_wizR.y + g_wizR.h - S(18) - S(36);
+	const bool last = g_wizStep == kWizSteps;
+
+	Push(g_wizR.x + S(18), by, S(104), S(36), L"Wstecz", ID_WIZ_BACK, kNone, g_wizStep > 1, L"Poprzedni krok.", Icon::None);
+	Push(g_wizR.x + g_wizR.w - S(18) - S(146), by, S(146), S(36), last ? L"Gotowe" : L"Dalej", ID_WIZ_NEXT, kAccent,
+	     g_wizStep > 1 || WizInput() != nullptr, last ? L"Zamknij kreatora." : L"Następny krok.", Icon::None, BStyle::Solid);
+	if (!last)
+		Push(g_wizR.x + g_wizR.w - S(18) - S(146) - S(8) - S(104), by, S(104), S(36), L"Przerwij", ID_WIZ_CLOSE, kNone, true,
+		     L"Zamknij kreatora. To, co już powstało, zostaje.", Icon::None);
+
+	const float cy = g_wizR.y + S(112);
+	switch (g_wizStep) {
+	case 1:
+		if (!WizInput())
+			Push(g_wizR.x + S(24), cy + S(56), S(220), S(38), L"Utwórz wejście", ID_WIZ_MAKE, kAccent, true,
+			     L"Dopisuje wejście do livedelay.ini i przeładowuje silnik.", Icon::Ingest, BStyle::Solid);
+		break;
+	case 2:
+		Push(g_wizR.x + g_wizR.w - S(24) - S(104), cy + S(34), S(104), S(32), L"Kopiuj", ID_WIZ_URL, kNone, true,
+		     L"Skopiuj adres serwera.", Icon::Copy);
+		Push(g_wizR.x + g_wizR.w - S(24) - S(104), cy + S(34) + S(44), S(104), S(32), L"Kopiuj", ID_WIZ_KEY, kNone,
+		     WizInput() != nullptr, L"Skopiuj klucz tego wejścia.", Icon::Copy);
+		break;
+	case 4:
+		Push(g_wizR.x + S(24), cy + S(96), S(260), S(38), L"Ustawienia platform", ID_WIZ_DESTS, kNone, true,
+		     L"Otwiera Ustawienia → Platformy, gdzie wskazuje się wejście i wkleja klucz.", Icon::Settings);
+		break;
+	default:
+		break;
+	}
+}
+
 void LayoutInputs(float x, float y, float w, float bottom) {
-	g_inputsR = {x, y, w, std::max(S(kInputCard), bottom - y)};
+	if (g_wizStep > 0) {
+		LayoutWizard(x, y, w, bottom);
+		return;
+	}
+	g_wizRowR = {x, y, w, S(38)};
+	Push(x + w - S(268), y, S(268), S(38), L"Kreator pionowego streamu", ID_WIZ, kAccent, true,
+	     L"Drugie wejście na pionowy obraz — krok po kroku.", Icon::Ingest);
+
+	const float listY = y + S(38) + S(16);
+	g_inputsR = {x, listY, w, std::max(S(kInputCard), bottom - listY)};
 	for (size_t i = 0; i < g_inputs.size(); ++i) {
-		const float cy = y + i * (S(kInputCard) + S(12));
+		const float cy = listY + i * (S(kInputCard) + S(12));
 		if (cy + S(kInputCard) > bottom)
 			break;
 		Push(x + w - S(18) - S(136), cy + S(kInputCard) - S(16) - S(30), S(136), S(30), L"Kopiuj klucz",
@@ -1668,7 +1765,127 @@ void PaintBoard() {
 	}
 }
 
+void PaintWizard() {
+	Card(g_wizR);
+	const float x = g_wizR.x + S(24);
+	Text(x, g_wizR.y + S(18), L"KREATOR PIONOWEGO STREAMU", kMuted, Fnt::Grp);
+
+	// Four dots, the one being done filled.
+	const float dx = g_wizR.x + g_wizR.w - S(24);
+	TextRight(dx, g_wizR.y + S(24), L"krok " + std::to_wstring(g_wizStep) + L" z " + std::to_wstring(kWizSteps), kMuted,
+		  Fnt::Small);
+	for (int i = 0; i < kWizSteps; ++i) {
+		const float cx = dx - S(10) - (kWizSteps - 1 - i) * S(16);
+		FillDot(cx, g_wizR.y + S(50), S(4), i + 1 == g_wizStep ? kAccent : i + 1 < g_wizStep ? Alpha(kAccent, 0.45f) : kLine2);
+	}
+
+	const Input *in = WizInput();
+	const float cy = g_wizR.y + S(112);
+	auto body = [&](const wchar_t *title, std::initializer_list<const wchar_t *> lines) {
+		Text(x, g_wizR.y + S(44), title, kText, Fnt::Title);
+		float ly = g_wizR.y + S(74);
+		for (const wchar_t *l : lines) {
+			Text(x, ly, l, kMuted, Fnt::Small);
+			ly += S(19);
+		}
+	};
+	auto row = [&](float ry, const wchar_t *label, const std::wstring &value, Col c) {
+		Text(x, ry, label, kMuted, Fnt::Small);
+		Text(x + S(150), ry, value, c, Fnt::Mono);
+	};
+
+	switch (g_wizStep) {
+	case 1:
+		if (in)
+			body(L"Zrób drugie wejście",
+			     {L"LiveDelay ma już drugi adres do publikowania — osobny od tego, którym leci obraz poziomy."});
+		else
+			body(L"Zrób drugie wejście",
+			     {L"LiveDelay dostanie drugi adres do publikowania — osobny od tego, którym leci obraz poziomy.",
+			      L"Przeładuje przy tym silnik: transmisja na chwilę się urwie, a bufor opóźnienia przepadnie."});
+		if (in) {
+			FillDot(x + S(5), cy + S(20), S(4), kGreen);
+			Text(x + S(18), cy + S(12), L"Wejście " + in->name + L" gotowe.", kGreen, Fnt::Body);
+			TextMid(x + S(18) + TextW(L"Wejście " + in->name + L" gotowe.", Fnt::Body) + S(10), cy + S(20), in->key, kMuted,
+				Fnt::Mono);
+			Text(x, cy + S(44), WizBufferLine(), kMuted, Fnt::Small);
+		} else {
+			Text(x, cy + S(12), L"Nazwa: " + g_wizName + L". Klucz nadamy sami — nic nie wpisujesz.", kMuted, Fnt::Small);
+			Text(x, cy + S(32), WizBufferLine(), kMuted, Fnt::Small);
+		}
+		break;
+	case 2:
+		body(L"Wypchnij na nie pionowy obraz",
+		     {L"W programie, który robi pionowy obraz — w OBS zwykle Aitum Vertical — ustaw własny serwer:",
+		      L"szukaj pól z adresem serwera i kluczem transmisji w jego ustawieniach wyjścia."});
+		row(cy + S(42), L"Adres serwera", RtmpUrl(), kGreen);
+		FillRound(x, cy + S(70), g_wizR.w - S(48), S(1), 0, kLine);
+		row(cy + S(86), L"Klucz wejścia", in ? in->key : L"—", kText);
+		Text(x, cy + S(126), L"To nie jest klucz TikToka ani żadnej innej platformy — tylko adres do LiveDelay.", kMuted,
+		     Fnt::Small);
+		break;
+	case 3:
+		body(L"Czekam na sygnał",
+		     {L"Włącz pionową transmisję u siebie. Zapali się dopiero wtedy, gdy pakiety naprawdę tu dojdą."});
+		if (in && in->live) {
+			FillDot(x + S(5), cy + S(20), S(5), Alpha(kGreen, Pulse()));
+			std::wstring seen = L"Widzę " + (in->width > 0 ? std::to_wstring(in->width) + L"×" + std::to_wstring(in->height)
+									 : std::wstring(L"obraz")) +
+					    L", " + Round(in->kbps) + L" kb/s";
+			Text(x + S(20), cy + S(10), seen, kGreen, Fnt::Title);
+			const wchar_t *shape = in->width == 0		      ? L"Rozdzielczości jeszcze nie znam."
+					       : in->height > in->width	      ? L"Pionowy — tego chcieliśmy."
+									      : L"To wygląda na obraz poziomy. Sprawdź, czy wypychasz pionową kanwę.";
+			Text(x + S(20), cy + S(40), shape, in->width > 0 && in->height <= in->width ? kAmber : kMuted, Fnt::Small);
+		} else {
+			FillDot(x + S(5), cy + S(20), S(5), kDim);
+			Text(x + S(20), cy + S(10), L"Nic jeszcze nie przyszło.", kMuted, Fnt::Title);
+			const wchar_t *check[] = {
+				L"· adres serwera i klucz wklejone bez spacji na końcu,",
+				L"· pionowe wyjście naprawdę wystartowane, nie tylko skonfigurowane,",
+				L"· zapora nie blokuje połączenia na tym komputerze.",
+			};
+			float ly = cy + S(44);
+			for (const wchar_t *l : check) {
+				Text(x + S(20), ly, l, kMuted, Fnt::Small);
+				ly += S(19);
+			}
+		}
+		break;
+	default: {
+		body(L"Dokąd to leci",
+		     {L"Zostało wskazać platformy, które mają brać obraz z tego wejścia, i wkleić im klucze."});
+		std::wstring fed;
+		for (const Dest &d : g_dests)
+			if (in && d.input == in->name)
+				fed += (fed.empty() ? L"" : L"  ·  ") + d.name;
+		const bool none = fed.empty();
+		FillDot(x + S(5), cy + S(14), S(4), none ? kAmber : kGreen);
+		Text(x + S(18), cy + S(6), none ? L"Żadna platforma jeszcze z tego nie korzysta." : fed, none ? kAmber : kText,
+		     Fnt::Body);
+		Text(x, cy + S(34), L"Klucz do TikToka dostaniesz tylko na koncie z dostępem do transmisji.", kMuted, Fnt::Small);
+		float ly = cy + S(146);
+		Text(x, ly, WizBufferLine(), kMuted, Fnt::Small);
+		ly += S(19);
+		Text(x, ly,
+		     g_delayPerInput ? L"Opóźnienie ustawiasz osobno dla każdego wejścia — przyciski masz na Pulpicie."
+				     : L"Opóźnienie jest wspólne dla wszystkich wejść. Osobne włączysz w Ustawieniach → Wejścia.",
+		     kMuted, Fnt::Small);
+		break;
+	}
+	}
+
+	if (!g_wizNote.empty())
+		Text(x, g_wizR.y + g_wizR.h - S(18) - S(36) - S(24), g_wizNote, kRed, Fnt::Small);
+}
+
 void PaintInputs() {
+	if (g_wizStep > 0) {
+		PaintWizard();
+		return;
+	}
+	Text(g_wizRowR.x, g_wizRowR.y + S(4), L"WEJŚCIA SILNIKA", kMuted, Fnt::Grp);
+	Text(g_wizRowR.x, g_wizRowR.y + S(21), L"Każde ma własny klucz i własny bufor.", kMuted, Fnt::Small);
 	if (g_inputs.empty()) {
 		Card(g_inputsR);
 		TextMid(g_inputsR.x + S(24), g_inputsR.y + S(34),
@@ -2102,6 +2319,61 @@ void DoButton(int id) {
 			g_viewSlide = 1.0f;
 		g_view = View::About;
 		UpdateCheckNow();
+		break;
+	case ID_WIZ:
+		g_wizStep = 1;
+		g_wizNote.clear();
+		ReadWizBuffer();
+		g_viewSlide = 1.0f;
+		break;
+	case ID_WIZ_CLOSE:
+		g_wizStep = 0;
+		g_viewSlide = 1.0f;
+		break;
+	case ID_WIZ_BACK:
+		if (g_wizStep > 1)
+			--g_wizStep;
+		g_wizNote.clear();
+		break;
+	case ID_WIZ_NEXT:
+		if (g_wizStep >= kWizSteps) {
+			g_wizStep = 0;
+			g_viewSlide = 1.0f;
+		} else
+			++g_wizStep;
+		g_wizNote.clear();
+		break;
+	case ID_WIZ_MAKE: {
+		// Adding an input means restarting the engine, so say so while it matters.
+		if (g_input &&
+		    MessageBoxW(g_hwnd,
+				L"Nowe wejście wymaga przeładowania silnika.\n\n"
+				L"Transmisja na chwilę się urwie, a bufor opóźnienia przepadnie.\n"
+				L"Zrobić to teraz?",
+				L"LiveDelay", MB_OKCANCEL | MB_ICONWARNING) != IDOK)
+			break;
+		const std::wstring made = ld::AddInput(g_wizName);
+		if (made.empty()) {
+			g_wizNote = L"Nie udało się zapisać livedelay.ini. Sprawdź, czy plik nie jest tylko do odczytu.";
+			break;
+		}
+		g_wizName = made;
+		AppLog(L"kreator: dodano wejście " + made);
+		ld::ReloadEngine();
+		ReadIniHints();
+		ReadWizBuffer();
+		Refresh();
+		break;
+	}
+	case ID_WIZ_URL:
+		Copy(g_hwnd, RtmpUrl());
+		break;
+	case ID_WIZ_KEY:
+		if (const Input *in = WizInput())
+			Copy(g_hwnd, in->key);
+		break;
+	case ID_WIZ_DESTS:
+		OpenSettings();
 		break;
 	case ID_DANGER_PICK:
 		g_dangerOn = !g_dangerOn;
