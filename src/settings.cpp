@@ -41,6 +41,13 @@ enum {
 	IDC_OVSHOW = 160, // +0..3
 	IDC_HOTKEY = 170, // +0..3
 	IDC_HOTCAP = 180, // +0..3
+	IDC_INLIST = 200,
+	IDC_INADD,
+	IDC_INDEL,
+	IDC_INNAME,
+	IDC_INKEY,
+	IDC_DESTIN,   // which input feeds the selected platform
+	IDC_DELAYMODE,
 	IDC_SAVE = 190,
 	IDC_CANCEL,
 	IDC_OPENINI,
@@ -124,7 +131,13 @@ std::wstring HostOf(const std::wstring &url) {
 	return url.substr(start, end == std::wstring::npos ? std::wstring::npos : end - start);
 }
 
-constexpr int kPages = 4;
+constexpr int kPages = 5;
+/// Inputs got the next free page number so the others keep theirs; the menu
+/// below puts it where it belongs, second.
+constexpr int kPgInputs = 4;
+const wchar_t *const kPageName[kPages] = {L"Ogólne", L"Platformy", L"Overlay", L"Skróty", L"Wejścia"};
+/// Display order of the menu: page numbers, not positions.
+const int kMenuOrder[kPages] = {0, kPgInputs, 1, 2, 3};
 const char *const kHotkeyKey[4] = {"hotkey_arm", "hotkey_activate", "hotkey_cut", "hotkey_cut_after"};
 const wchar_t *const kHotkeyLabel[4] = {L"Uzbrój", L"Włącz opóźnienie", L"Na żywo", L"Na żywo po emisji"};
 constexpr int kStates = 4;
@@ -140,6 +153,15 @@ struct DestRow {
 	int origin = -1;
 	/// The [dest NAME] it was read under; empty for a platform added here.
 	std::wstring fileName;
+	/// Name of the input that feeds it; empty on an engine without inputs.
+	std::wstring input;
+};
+
+/// One [input NAME] section: an ingest the engine listens on.
+struct InputRow {
+	std::wstring name, key;
+	/// The [input NAME] it was read under; empty for one added here.
+	std::wstring fileName;
 };
 
 struct Snapshot {
@@ -147,6 +169,8 @@ struct Snapshot {
 	int buffer = 512;
 	std::wstring listen, api;
 	std::vector<DestRow> rows;
+	std::vector<InputRow> inputs;
+	bool perInput = false;
 	std::string overlay;
 };
 
@@ -270,6 +294,12 @@ bool g_filling = false; // fields are being set from the file, not by the user
 HWND g_sync;            // the line that reports an outside change
 std::string g_overlay;
 std::vector<DestRow> g_rows;
+std::vector<InputRow> g_ins;
+int g_inSel = -1;
+/// False when /state carries no "inputs": an engine too old to know them. Then
+/// nothing about inputs is shown and nothing writes [input …] into the file.
+bool g_engineInputs = false;
+bool g_perInput = false;
 Snapshot g_orig;
 
 struct Ctl {
@@ -402,6 +432,13 @@ std::vector<Block> SplitIni(const std::string &text) {
 	return blocks;
 }
 
+/// A section the window just created has no blank line after it, which would
+/// glue the next header onto its last key. Readable beats compact here.
+void EndWithBlank(std::vector<std::string> &lines) {
+	if (lines.empty() || !TrimAscii(lines.back()).empty())
+		lines.push_back("");
+}
+
 std::string JoinIni(const std::vector<Block> &blocks, const char *eol) {
 	std::string out;
 	for (const Block &b : blocks) {
@@ -431,6 +468,16 @@ void SetLineKey(std::vector<std::string> &lines, const char *key, const std::str
 	while (at > 0 && TrimAscii(lines[at - 1]).empty())
 		--at;
 	lines.insert(lines.begin() + at, std::string(key) + " = " + value);
+}
+
+/// Removes the first `key = …` line, if it is there at all.
+void DropLineKey(std::vector<std::string> &lines, const char *key) {
+	std::string k, v;
+	for (size_t i = 0; i < lines.size(); ++i)
+		if (SplitKey(lines[i], k, v) && k == key) {
+			lines.erase(lines.begin() + i);
+			return;
+		}
 }
 
 std::string BlockValue(const Block &b, const char *key) {
@@ -882,10 +929,9 @@ void PaintShell(HDC dc) {
 	RECT title{Si(14) + logo + Si(10), 0, Si(400), Si(kTopH)};
 	DrawTextW(dc, L"LiveDelay — ustawienia", -1, &title, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-	const wchar_t *pages[kPages] = {L"Ogólne", L"Platformy", L"Overlay", L"Skróty"};
 	SelectObject(dc, g_title);
 	RECT heading{Si(kPadX), Si(kTopH) + Si(14), Si(kRight), Si(kTopH) + Si(48)};
-	DrawTextW(dc, pages[g_page], -1, &heading, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+	DrawTextW(dc, kPageName[g_page], -1, &heading, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 }
 
 // Edits and the list have no border of their own, so the window draws one.
@@ -957,11 +1003,12 @@ void ShowRow(int i) {
 		bool prev;
 		~Restore() { g_filling = prev; }
 	} restore{wasFilling};
+	const int feeds = g_engineInputs ? IDC_DESTIN : IDC_INGEST;
 	const bool any = i >= 0 && i < (int)g_rows.size();
-	for (int id : {IDC_NAME, IDC_URL, IDC_KEY, IDC_INGEST, IDC_AUTOSTART, IDC_SHOWKEY})
+	for (int id : {(int)IDC_NAME, (int)IDC_URL, (int)IDC_KEY, feeds, (int)IDC_AUTOSTART, (int)IDC_SHOWKEY})
 		EnableWindow(Of(id), any);
 	if (!any) {
-		for (int id : {IDC_NAME, IDC_URL, IDC_KEY, IDC_INGEST})
+		for (int id : {(int)IDC_NAME, (int)IDC_URL, (int)IDC_KEY, feeds})
 			Set(id, L"");
 		return;
 	}
@@ -969,7 +1016,12 @@ void ShowRow(int i) {
 	Set(IDC_NAME, d.name);
 	Set(IDC_URL, d.url);
 	Set(IDC_KEY, d.key);
-	Set(IDC_INGEST, d.ingest);
+	if (g_engineInputs) {
+		Set(IDC_DESTIN, d.input.empty() ? L"—" : d.input);
+		InvalidateRect(Of(IDC_DESTIN), nullptr, TRUE);
+	} else {
+		Set(IDC_INGEST, d.ingest);
+	}
 	SetChecked(IDC_AUTOSTART, d.autostart);
 	ShowServiceLabels();
 }
@@ -982,8 +1034,47 @@ void StoreRow(int i) {
 	d.name = Trim(Get(IDC_NAME));
 	d.url = Trim(Get(IDC_URL));
 	d.key = Trim(Get(IDC_KEY));
-	d.ingest = Trim(Get(IDC_INGEST));
+	if (!g_engineInputs)
+		d.ingest = Trim(Get(IDC_INGEST)); // with inputs, the key belongs to the input
 	d.autostart = Checked(IDC_AUTOSTART);
+}
+
+// ---------------------------------------------------------------- inputs
+
+void FillInputList() {
+	HWND list = Of(IDC_INLIST);
+	SendMessageW(list, LB_RESETCONTENT, 0, 0);
+	for (const InputRow &in : g_ins)
+		SendMessageW(list, LB_ADDSTRING, 0, (LPARAM)(in.name.empty() ? L"(bez nazwy)" : in.name.c_str()));
+	if (g_inSel >= 0)
+		SendMessageW(list, LB_SETCURSEL, g_inSel, 0);
+}
+
+void ShowInput(int i) {
+	const bool wasFilling = g_filling;
+	g_filling = true;
+	struct Restore {
+		bool prev;
+		~Restore() { g_filling = prev; }
+	} restore{wasFilling};
+	const bool any = i >= 0 && i < (int)g_ins.size();
+	EnableWindow(Of(IDC_INNAME), any);
+	EnableWindow(Of(IDC_INKEY), any);
+	Set(IDC_INNAME, any ? g_ins[i].name : L"");
+	Set(IDC_INKEY, any ? g_ins[i].key : L"");
+}
+
+void StoreInput(int i) {
+	if (i < 0 || i >= (int)g_ins.size())
+		return;
+	const std::wstring was = g_ins[i].name;
+	g_ins[i].name = Trim(Get(IDC_INNAME));
+	g_ins[i].key = Trim(Get(IDC_INKEY));
+	// A rename has to follow through to every platform that names this input.
+	if (was != g_ins[i].name && !was.empty())
+		for (DestRow &d : g_rows)
+			if (d.input == was)
+				d.input = g_ins[i].name;
 }
 
 void SelectRow(int i) {
@@ -1030,6 +1121,7 @@ void ReadEverything() {
 		d.url = Utf8(BlockValue(blocks[i], "url"));
 		d.key = Utf8(BlockValue(blocks[i], "key"));
 		d.ingest = Utf8(BlockValue(blocks[i], "ingest_key"));
+		d.input = Utf8(BlockValue(blocks[i], "input"));
 		std::string autostart = BlockValue(blocks[i], "autostart");
 		d.autostart = autostart.empty() || Yes(autostart);
 		d.origin = (int)i;
@@ -1038,6 +1130,23 @@ void ReadEverything() {
 	g_orig.rows = g_rows;
 	g_sel = g_rows.empty() ? -1 : 0;
 
+	g_ins.clear();
+	for (size_t i = 1; i < blocks.size(); ++i) {
+		if (blocks[i].kind != Section::Input)
+			continue;
+		InputRow in;
+		in.name = Utf8(InputName(blocks[i].header));
+		in.key = Utf8(BlockValue(blocks[i], "key"));
+		in.fileName = in.name;
+		if (!in.name.empty())
+			g_ins.push_back(in);
+	}
+	g_orig.inputs = g_ins;
+	g_inSel = g_ins.empty() ? -1 : 0;
+
+	g_perInput = IniLine(g_iniText, "delay_mode") == L"per_input";
+	g_orig.perInput = g_perInput;
+
 	g_overlay = Http(L"GET", L"/overlay/config");
 	if (g_overlay.find('{') == std::string::npos)
 		g_overlay.clear();
@@ -1045,6 +1154,8 @@ void ReadEverything() {
 
 	std::string state = Http(L"GET", L"/state");
 	g_inKbps = JsonNumber(state, "in_kbps");
+	// Only an engine that reports inputs may be given [input …] sections.
+	g_engineInputs = state.find("\"inputs\":[") != std::string::npos;
 }
 
 std::wstring BufferHint() {
@@ -1075,10 +1186,34 @@ std::string BuildIni() {
 	for (int i = 0; i < 4; ++i)
 		SetLineKey(out[0].lines, kHotkeyKey[i], WideUtf8(Trim(Get(IDC_HOTKEY + i))));
 
-	// Sections this window does not own — inputs, and whatever a newer build or
-	// the panel wrote — go back untouched, before the platforms.
+	if (g_engineInputs)
+		SetLineKey(out[0].lines, "delay_mode", g_perInput ? "per_input" : "together");
+
+	// Inputs are ours to write once the engine knows them; on an older engine we
+	// do not touch them at all, because it would eat them at its next start.
+	if (g_engineInputs) {
+		for (const InputRow &in : g_ins) {
+			Block b;
+			if (!in.fileName.empty())
+				for (size_t i = 1; i < blocks.size(); ++i)
+					if (blocks[i].kind == Section::Input && Utf8(InputName(blocks[i].header)) == in.fileName) {
+						b = blocks[i];
+						break;
+					}
+			b.header = "[input " + WideUtf8(in.name) + "]";
+			SetLineKey(b.lines, "key", WideUtf8(in.key));
+			EndWithBlank(b.lines);
+			out.push_back(b);
+		}
+	} else {
+		for (const Block &b : blocks)
+			if (b.kind == Section::Input)
+				out.push_back(b);
+	}
+
+	// Sections nobody here owns go back untouched.
 	for (const Block &b : blocks)
-		if (b.kind == Section::Input || b.kind == Section::Other)
+		if (b.kind == Section::Other)
 			out.push_back(b);
 
 	for (const DestRow &d : g_rows) {
@@ -1094,8 +1229,14 @@ std::string BuildIni() {
 		b.header = "[dest " + WideUtf8(d.name) + "]";
 		SetLineKey(b.lines, "url", WideUtf8(d.url));
 		SetLineKey(b.lines, "key", WideUtf8(d.key));
-		SetLineKey(b.lines, "ingest_key", WideUtf8(d.ingest));
+		if (g_engineInputs) {
+			SetLineKey(b.lines, "input", WideUtf8(d.input));
+			DropLineKey(b.lines, "ingest_key"); // the key belongs to the input now
+		} else {
+			SetLineKey(b.lines, "ingest_key", WideUtf8(d.ingest));
+		}
 		SetLineKey(b.lines, "autostart", d.autostart ? "yes" : "no");
+		EndWithBlank(b.lines);
 		out.push_back(b);
 	}
 	return JoinIni(out, eol);
@@ -1152,6 +1293,7 @@ void Warn(const wchar_t *text) {
 
 bool Save() {
 	StoreRow(g_sel);
+	StoreInput(g_inSel);
 	for (const DestRow &d : g_rows) {
 		if (d.name.empty()) {
 			Warn(L"Każda platforma musi mieć nazwę.");
@@ -1245,9 +1387,13 @@ bool Save() {
 void Build() {
 	// ---- the shell: title bar, then the pages down the left ----
 	MakeButton(L"", kWinW - 46, 0, 46, IDC_CLOSEWIN, -1, Kind::Close, kTopH);
-	const wchar_t *pages[kPages] = {L"Ogólne", L"Platformy", L"Overlay", L"Skróty"};
-	for (int i = 0; i < kPages; ++i)
-		MakeButton(pages[i], 12, kTopH + 14 + i * 41, kNavW - 24, IDC_TAB + i, -1, Kind::Nav, 40);
+	int row = 0;
+	for (int page : kMenuOrder) {
+		if (page == kPgInputs && !g_engineInputs)
+			continue; // an engine too old to know inputs is shown none
+		MakeButton(kPageName[page], 12, kTopH + 14 + row * 41, kNavW - 24, IDC_TAB + page, -1, Kind::Nav, 40);
+		++row;
+	}
 	MakeButton(L"Otwórz plik ini", 12, kWinH - 52, kNavW - 24, IDC_OPENINI, -1, Kind::Push, 34);
 	g_sync = MakeWrapLabel(L"", kPadX, kWinH - 58, kRight - kPadX - 250, 42, -1);
 	MakeButton(L"Anuluj", kRight - 238, kWinH - 54, 110, IDC_CANCEL, -1, Kind::Push, 34);
@@ -1274,9 +1420,11 @@ void Build() {
 	MakeLabel(L"s", kPadX + 318, generalY[0] + 4, 40, 0, true);
 	MakeLabel(L"MB", kPadX + 318, generalY[1] + 4, 40, 0, true);
 	g_hint = MakeWrapLabel(L"", kPadX + 188, generalY[1] + 36, kRight - kPadX - 188, 36, 0);
+	if (g_engineInputs)
+		MakeCheck(L"Osobne opóźnienie dla każdego wejścia", kPadX, 292, 420, IDC_DELAYMODE, 0, g_perInput);
 	MakeWrapLabel(L"Nasłuch RTMP to adres, który wpisujesz w programie nadającym z tego PC. Adres API obsługuje panel, "
 		      L"overlay i podgląd. Zmiana każdego z nich przeładowuje silnik.",
-		      kPadX, 304, kRight - kPadX, 44, 0);
+		      kPadX, 330, kRight - kPadX, 44, 0);
 
 	// ---- Platformy ----
 	MakeWrapLabel(L"LiveDelay odbiera obraz z tego PC i wysyła go dalej na te platformy.", kPadX, 92, kRight - kPadX, 22, 1);
@@ -1293,7 +1441,7 @@ void Build() {
 		{L"Serwer", IDC_SERVER},
 		{L"Adres", IDC_URL},
 		{L"Klucz streamu", IDC_KEY},
-		{L"Klucz wejściowy", IDC_INGEST},
+		{g_engineInputs ? L"Wejście" : L"Klucz wejściowy", g_engineInputs ? IDC_DESTIN : IDC_INGEST},
 	};
 	const int fieldX = kPadX + 180;
 	const int ctlX = fieldX + 120;
@@ -1301,7 +1449,7 @@ void Build() {
 		const int y = 120 + i * 40;
 		MakeLabel(dest[i].label, fieldX, y + 4, 120, 1);
 		const int id = dest[i].id;
-		if (id == IDC_SERVICE || id == IDC_SERVER)
+		if (id == IDC_SERVICE || id == IDC_SERVER || id == IDC_DESTIN)
 			MakeButton(L"", ctlX, y, kRight - ctlX, id, 1, Kind::Select, 28);
 		else
 			MakeEdit(ctlX, y, id == IDC_KEY ? kRight - ctlX - 90 : kRight - ctlX, id, 1,
@@ -1312,6 +1460,24 @@ void Build() {
 	MakeWrapLabel(L"Serwer wybierz z listy albo zostaw Własny adres i wpisz swój. Klucz wejściowy to ten, którym "
 		      L"program na tym PC publikuje do LiveDelay — puste pole silnik wypełnia sam.",
 		      fieldX, 398, kRight - fieldX, 60, 1);
+
+	// ---- Wejścia ----
+	MakeWrapLabel(L"Wejście to jeden strumień, który do ciebie przychodzi — każde ma własny klucz i własny bufor "
+		      L"opóźnienia. Drugie wejście zrobisz pod pionowy obraz na TikToka.",
+		      kPadX, 92, kRight - kPadX, 40, kPgInputs);
+	HWND inList = Make(L"LISTBOX", L"", WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS, kPadX, 140,
+			   160, 220, IDC_INLIST, kPgInputs);
+	SendMessageW(inList, LB_SETITEMHEIGHT, 0, Si(28));
+	g_framed.push_back(inList);
+	MakeButton(L"Dodaj", kPadX, 370, 77, IDC_INADD, kPgInputs, Kind::Push);
+	MakeButton(L"Usuń", kPadX + 83, 370, 77, IDC_INDEL, kPgInputs, Kind::Push);
+	MakeLabel(L"Nazwa", fieldX, 144, 120, kPgInputs);
+	MakeEdit(ctlX, 140, kRight - ctlX, IDC_INNAME, kPgInputs);
+	MakeLabel(L"Klucz", fieldX, 184, 120, kPgInputs);
+	MakeEdit(ctlX, 180, kRight - ctlX, IDC_INKEY, kPgInputs);
+	MakeWrapLabel(L"Klucz to ta część, którą wpisujesz w programie nadającym, obok adresu serwera. Musi być inny dla "
+		      L"każdego wejścia; puste pole silnik wypełnia sam.",
+		      fieldX, 224, kRight - fieldX, 60, kPgInputs);
 
 	// ---- Overlay ----
 	MakeLabel(L"Adres", kPadX, 100, 60, 2);
@@ -1360,6 +1526,11 @@ void FillFields() {
 		SetWindowTextW(g_hotStatus, HotkeyReport().c_str());
 	FillList();
 	ShowRow(g_sel);
+	if (g_engineInputs) {
+		FillInputList();
+		ShowInput(g_inSel);
+		SetChecked(IDC_DELAYMODE, g_perInput);
+	}
 
 	Set(IDC_OVURL, OverlayUrl());
 	const bool haveOverlay = !g_overlay.empty();
@@ -1443,6 +1614,78 @@ void OnCommand(int id, int code) {
 			FillList();
 			ShowRow(g_sel);
 		}
+		break;
+	case IDC_INLIST:
+		if (code == LBN_SELCHANGE) {
+			int i = (int)SendMessageW(Of(IDC_INLIST), LB_GETCURSEL, 0, 0);
+			if (i != g_inSel) {
+				StoreInput(g_inSel);
+				g_inSel = i;
+				FillInputList();
+				ShowInput(i);
+			}
+		}
+		break;
+	case IDC_INADD: {
+		StoreInput(g_inSel);
+		InputRow in;
+		in.name = L"Nowe wejście";
+		// Pick a key no other input uses.
+		for (int n = 0;; ++n) {
+			std::wstring candidate = L"ld" + std::to_wstring(n);
+			bool taken = false;
+			for (const InputRow &other : g_ins)
+				taken = taken || other.key == candidate;
+			if (!taken) {
+				in.key = candidate;
+				break;
+			}
+		}
+		g_ins.push_back(in);
+		g_inSel = (int)g_ins.size() - 1;
+		FillInputList();
+		ShowInput(g_inSel);
+		SetFocus(Of(IDC_INNAME));
+		SendMessageW(Of(IDC_INNAME), EM_SETSEL, 0, -1);
+		break;
+	}
+	case IDC_INDEL:
+		if (g_inSel >= 0 && g_inSel < (int)g_ins.size()) {
+			const std::wstring gone = g_ins[g_inSel].name;
+			g_ins.erase(g_ins.begin() + g_inSel);
+			g_inSel = g_ins.empty() ? -1 : std::min(g_inSel, (int)g_ins.size() - 1);
+			// Platforms cannot name an input that is no longer there.
+			const std::wstring fallback = g_ins.empty() ? std::wstring() : g_ins.front().name;
+			for (DestRow &d : g_rows)
+				if (d.input == gone)
+					d.input = fallback;
+			FillInputList();
+			ShowInput(g_inSel);
+			ShowRow(g_sel);
+		}
+		break;
+	case IDC_DESTIN: {
+		if (g_sel < 0 || g_sel >= (int)g_rows.size() || g_ins.empty())
+			break;
+		StoreRow(g_sel);
+		std::vector<std::wstring> names;
+		int current = -1;
+		for (size_t i = 0; i < g_ins.size(); ++i) {
+			names.push_back(g_ins[i].name);
+			if (g_ins[i].name == g_rows[g_sel].input)
+				current = (int)i;
+		}
+		const int picked = Pick(Of(IDC_DESTIN), names, current);
+		if (picked >= 0) {
+			g_rows[g_sel].input = g_ins[picked].name;
+			ShowRow(g_sel);
+			g_dirty = true;
+		}
+		break;
+	}
+	case IDC_DELAYMODE:
+		g_perInput = !g_perInput;
+		SetChecked(IDC_DELAYMODE, g_perInput);
 		break;
 	case IDC_SERVICE: {
 		std::vector<std::wstring> names;
