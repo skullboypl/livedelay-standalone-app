@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(livedelay-app VERSION 0.1.0 LANGUAGES CXX)
+project(livedelay-app VERSION 0.2.0 LANGUAGES CXX)
 
 add_executable(livedelay-app WIN32 src/app.cpp src/core.cpp src/settings.cpp src/webview.cpp src/update.cpp src/app.rc)
 set_target_properties(livedelay-app PROPERTIES OUTPUT_NAME livedelay CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
