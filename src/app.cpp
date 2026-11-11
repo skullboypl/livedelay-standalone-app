@@ -71,6 +71,16 @@ constexpr int HOTKEY_CUT_AFTER = 0x4C04;
 constexpr int ID_DEST = 200;
 // One per input row: copy that input's key.
 constexpr int ID_IN_KEY = 300;
+// Per-input actions, used only while delay_mode is per_input.
+constexpr int ID_IN_ARM = 320;
+constexpr int ID_IN_ACT = 340;
+constexpr int ID_IN_CUT = 360;
+
+// One row of the platforms card: a group header for an input, or a platform.
+struct DestLine {
+	int input = -1; // index into g_inputs, -1 for platforms with no known input
+	int dest = -1;  // index into g_dests, -1 when this line is the header
+};
 
 constexpr const wchar_t *kHelpUrl = L"https://livedelay.vxh.pl/";
 // The only resource in app.rc: the site's mark, in every size Windows asks for.
@@ -133,6 +143,7 @@ struct Dest {
 };
 
 std::vector<Dest> g_dests;
+std::vector<DestLine> g_destLines;
 
 // One per ingest the engine listens on. A platform names the input it is fed by.
 struct Input {
@@ -1233,23 +1244,72 @@ void LayoutBoard(float x, float y, float w, float bottom) {
 	y += ctrlH + S(16);
 
 	g_destsR = {x, y, w, std::max(S(118), bottom - y)};
-	const float rowH = S(32);
 	const float toggleW = S(80);
 	const float toggleH = S(26);
 	g_destTips.clear();
-	g_destTips.reserve(g_dests.size());
-	for (size_t i = 0; i < g_dests.size(); ++i) {
-		const float rowY = g_destsR.y + S(44) + rowH * (i + 1);
-		if (rowY + rowH > g_destsR.y + g_destsR.h)
+	g_destTips.reserve(g_dests.size() + g_inputs.size());
+
+	// Platforms are listed under the input that feeds them; anything whose input
+	// we do not recognise lands in a group of its own at the end.
+	g_destLines.clear();
+	if (g_hasInputs) {
+		for (size_t n = 0; n < g_inputs.size(); ++n) {
+			g_destLines.push_back({(int)n, -1});
+			for (size_t i = 0; i < g_dests.size(); ++i)
+				if (g_dests[i].input == g_inputs[n].name)
+					g_destLines.push_back({(int)n, (int)i});
+		}
+		bool orphan = false;
+		for (size_t i = 0; i < g_dests.size(); ++i) {
+			bool placed = false;
+			for (const Input &in : g_inputs)
+				placed = placed || g_dests[i].input == in.name;
+			if (placed)
+				continue;
+			if (!orphan) {
+				g_destLines.push_back({-1, -1});
+				orphan = true;
+			}
+			g_destLines.push_back({-1, (int)i});
+		}
+	} else {
+		g_destLines.push_back({-1, -1}); // the single incoming stream
+		for (size_t i = 0; i < g_dests.size(); ++i)
+			g_destLines.push_back({-1, (int)i});
+	}
+
+	float rowY = g_destsR.y + S(40);
+	for (const DestLine &line : g_destLines) {
+		const float h = line.dest < 0 ? S(30) : S(32);
+		if (rowY + h > g_destsR.y + g_destsR.h)
 			break;
-		const bool on = g_dests[i].on;
-		std::wstring tip = on ? L"Zakończ stream tylko na tej platformie." : L"Zacznij wysyłać na tę platformę teraz.";
-		if (g_dests[i].state == "error")
-			tip = g_dests[i].name + L": " + DestErrorLong(g_dests[i]);
+		if (line.dest < 0) {
+			// Its own arm and cut, but only when each input runs on its own delay.
+			if (g_delayPerInput && line.input >= 0 && g_connected) {
+				const Input &in = g_inputs[line.input];
+				const float bw = S(74);
+				float bx = g_destsR.x + g_destsR.w - pad - bw;
+				Push(bx, rowY + S(2), bw, S(24), L"Na żywo", ID_IN_CUT + line.input, kGreen, in.delayed,
+				     L"Wróć na żywo na tym wejściu.", Icon::None);
+				bx -= bw + S(6);
+				Push(bx, rowY + S(2), bw, S(24), L"Włącz", ID_IN_ACT + line.input, kRed, !in.delayed && in.armed,
+				     L"Włącz opóźnienie na tym wejściu.", Icon::None);
+				bx -= bw + S(6);
+				Push(bx, rowY + S(2), bw, S(24), L"Uzbrój", ID_IN_ARM + line.input, kAmber, !in.delayed,
+				     L"Uzbrój to wejście osobno.", Icon::None);
+			}
+			rowY += h;
+			continue;
+		}
+		const Dest &d = g_dests[line.dest];
+		std::wstring tip = d.on ? L"Zakończ stream tylko na tej platformie." : L"Zacznij wysyłać na tę platformę teraz.";
+		if (d.state == "error")
+			tip = d.name + L": " + DestErrorLong(d);
 		g_destTips.push_back(std::move(tip));
-		Push(g_destsR.x + g_destsR.w - pad - toggleW, rowY + (rowH - toggleH) * 0.5f, toggleW, toggleH,
-		     on ? L"Zakończ" : L"Live", ID_DEST + (int)i, on ? kRed : kGreen, g_connected, g_destTips.back().c_str(),
-		     Icon::None);
+		Push(g_destsR.x + g_destsR.w - pad - toggleW, rowY + (h - toggleH) * 0.5f, toggleW, toggleH,
+		     d.on ? L"Zakończ" : L"Live", ID_DEST + line.dest, d.on ? kRed : kGreen, g_connected,
+		     g_destTips.back().c_str(), Icon::None);
+		rowY += h;
 	}
 }
 
@@ -1555,39 +1615,56 @@ void PaintBoard() {
 	Card(g_destsR);
 	Text(g_destsR.x + S(18), g_destsR.y + S(16), L"PLATFORMY", kMuted, Fnt::Grp);
 
-	const float rowH = S(32);
 	const float dotX = g_destsR.x + S(22);
-	const float nameX = g_destsR.x + S(38);
 	const float right = g_destsR.x + g_destsR.w - S(18);
 	const float sparkW = S(64);
 	const float stateRight = right - S(80) - S(12);
 
-	float cy = g_destsR.y + S(44) + rowH * 0.5f;
-	// The incoming feed is not a state, so it stays colourless.
-	FillDot(dotX, cy, S(4), g_input ? kMuted : kDim);
-	TextMid(nameX, cy, L"Z twojego PC", kText);
-	const std::wstring inRate = g_input ? Round(g_inKbps) + L" kb/s" : L"brak sygnału";
-	TextRight(stateRight, cy, inRate, kMuted, g_input ? Fnt::Mono : Fnt::Small);
-	DrawSparkline(kInputKey, stateRight - TextW(inRate, g_input ? Fnt::Mono : Fnt::Small) - S(12) - sparkW, cy, sparkW,
-		      S(16), kMuted);
-
-	if (g_dests.empty()) {
-		TextMid(nameX, cy + rowH, g_connected ? L"Brak platform: dodaj je w Ustawieniach" : L"—", kMuted, Fnt::Small);
+	if (g_dests.empty() && g_inputs.empty()) {
+		TextMid(g_destsR.x + S(38), g_destsR.y + S(56),
+			g_connected ? L"Brak platform: dodaj je w Ustawieniach" : L"—", kMuted, Fnt::Small);
 		return;
 	}
-	for (size_t i = 0; i < g_dests.size(); ++i) {
-		const Dest &d = g_dests[i];
-		cy = g_destsR.y + S(44) + rowH * (i + 1) + rowH * 0.5f;
-		if (cy + rowH * 0.5f > g_destsR.y + g_destsR.h)
+
+	float rowY = g_destsR.y + S(40);
+	for (const DestLine &line : g_destLines) {
+		const float h = line.dest < 0 ? S(30) : S(32);
+		if (rowY + h > g_destsR.y + g_destsR.h)
 			break;
+		const float cy = rowY + h * 0.5f;
+
+		if (line.dest < 0) {
+			// Group header: the input that feeds the platforms under it.
+			const bool known = line.input >= 0;
+			const std::wstring name = known ? g_inputs[line.input].name : (g_hasInputs ? L"Bez wejścia" : L"Z twojego PC");
+			const bool live = known ? g_inputs[line.input].live : g_input;
+			const double kbps = known ? g_inputs[line.input].kbps : g_inKbps;
+			FillDot(dotX, cy, S(4), live ? kMuted : kDim);
+			TextMid(g_destsR.x + S(38), cy, name, kText, Fnt::Bold);
+			if (known)
+				TextMid(g_destsR.x + S(38) + TextW(name, Fnt::Bold) + S(10), cy, g_inputs[line.input].key, kDim,
+					Fnt::Mono);
+			const std::wstring rate = live ? Round(kbps) + L" kb/s" : L"brak sygnału";
+			// In per-input mode the buttons sit on the right, so the rate moves left.
+			const float rateRight = (g_delayPerInput && known && g_connected) ? right - S(248) : stateRight;
+			TextRight(rateRight, cy, rate, kMuted, live ? Fnt::Mono : Fnt::Small);
+			const std::wstring sparkKey = known ? g_inputs[line.input].name : kInputKey;
+			DrawSparkline(sparkKey, rateRight - TextW(rate, live ? Fnt::Mono : Fnt::Small) - S(12) - sparkW, cy,
+				      sparkW, S(16), kMuted);
+			rowY += h;
+			continue;
+		}
+
+		const Dest &d = g_dests[line.dest];
 		const Col col = DestColor(d);
-		FillDot(dotX, cy, S(4), col);
-		TextMid(nameX, cy, d.name, kText);
+		FillDot(dotX + S(14), cy, S(4), col);
+		TextMid(g_destsR.x + S(52), cy, d.name, kText);
 		std::wstring st = DestState(d);
 		if (d.kbps > 0)
 			st += L" · " + Round(d.kbps) + L" kb/s";
 		TextRight(stateRight, cy, st, kMuted, Fnt::Small);
 		DrawSparkline(d.name, stateRight - TextW(st, Fnt::Small) - S(12) - sparkW, cy, sparkW, S(16), col);
+		rowY += h;
 	}
 }
 
@@ -1898,6 +1975,28 @@ void DoButton(int id) {
 			g_viewSlide = 1.0f;
 		g_view = (View)(id - ID_NAV);
 		ShowWindow(g_hwnd, SW_SHOW);
+		InvalidateRect(g_hwnd, nullptr, FALSE);
+		return;
+	}
+	if (id >= ID_IN_KEY && id < ID_IN_KEY + 16) {
+		const size_t i = (size_t)(id - ID_IN_KEY);
+		if (i < g_inputs.size())
+			Copy(g_hwnd, g_inputs[i].key);
+		return;
+	}
+	if (id >= ID_IN_ARM && id < ID_IN_CUT + 16) {
+		const int base = id >= ID_IN_CUT ? ID_IN_CUT : id >= ID_IN_ACT ? ID_IN_ACT : ID_IN_ARM;
+		const size_t i = (size_t)(id - base);
+		if (i < g_inputs.size()) {
+			// A key carries no spaces, so it needs no escaping in the query.
+			const std::wstring who = L"?input=" + g_inputs[i].key;
+			if (base == ID_IN_ARM)
+				PostAction(L"/arm" + who + L"&delay=" + std::to_wstring(g_delay));
+			else if (base == ID_IN_ACT)
+				PostAction(L"/activate" + who);
+			else
+				PostAction(L"/cut" + who);
+		}
 		InvalidateRect(g_hwnd, nullptr, FALSE);
 		return;
 	}
@@ -2693,7 +2792,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 	const DWORD style = WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU | WS_CLIPCHILDREN;
 	// WS_POPUP alone would drop the window off the taskbar.
 	g_hwnd = CreateWindowExW(WS_EX_APPWINDOW, wc.lpszClassName, L"LiveDelay", style, CW_USEDEFAULT, CW_USEDEFAULT,
-				 Si(920), Si(620), nullptr, nullptr, inst, nullptr);
+				 Si(920), Si(720), nullptr, nullptr, inst, nullptr);
 	SuppressSystemFrame(g_hwnd);
 
 	g_dc = GetDC(g_hwnd);

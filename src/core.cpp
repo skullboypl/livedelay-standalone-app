@@ -32,6 +32,7 @@ std::wstring g_ini;
 std::wstring g_listen = L"127.0.0.1:1935";
 std::wstring g_api = L"127.0.0.1:7799";
 std::wstring g_ingest = L"ld0";
+bool g_delayPerInput = false;
 
 // ---------------------------------------------------------------- text
 
@@ -121,6 +122,7 @@ void ReadIniHints() {
 	std::wstring listen = IniLine(text, "listen");
 	std::wstring api = IniLine(text, "api");
 	std::wstring ingest = IniLine(text, "ingest_key");
+	g_delayPerInput = IniLine(text, "delay_mode") == L"per_input";
 	if (!listen.empty())
 		g_listen = listen;
 	if (!api.empty())

@@ -89,6 +89,8 @@ extern std::wstring g_ini;
 extern std::wstring g_listen;
 extern std::wstring g_api;
 extern std::wstring g_ingest;
+/// delay_mode = per_input: each input is armed and cut on its own.
+extern bool g_delayPerInput;
 
 void SetIniPath(const std::wstring &path);
 void ReadIniHints();
